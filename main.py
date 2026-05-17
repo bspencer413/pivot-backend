@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.0"
+VERSION = "0.1.2"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -525,8 +525,8 @@ async def list_searches(user_id: int = Depends(get_current_user)):
 @app.post("/pv/searches")
 async def add_search(item: SearchItem, user_id: int = Depends(get_current_user)):
     # Validate radius_value.
-    if item.radius_value not in ("5", "10", "25", "50", "remote"):
-        raise HTTPException(status_code=400, detail="radius_value must be 5/10/25/50/remote")
+    if item.radius_value not in ("1", "5", "10", "25", "50", "remote"):
+        raise HTTPException(status_code=400, detail="radius_value must be 1/5/10/25/remote")
     # Lat/lng required unless radius is remote.
     if item.radius_value != "remote":
         if item.lat is None or item.lng is None:
@@ -596,8 +596,8 @@ async def update_search(search_id: int, update: SearchUpdate, user_id: int = Dep
         if update.lng is not None:
             sets.append("lng = %s"); params.append(update.lng)
         if update.radius_value is not None:
-            if update.radius_value not in ("5", "10", "25", "50", "remote"):
-                raise HTTPException(status_code=400, detail="radius_value must be 5/10/25/50/remote")
+            if update.radius_value not in ("1", "5", "10", "25", "50", "remote"):
+                raise HTTPException(status_code=400, detail="radius_value must be 1/5/10/25/remote")
             sets.append("radius_value = %s"); params.append(update.radius_value)
         if update.alert_level is not None:
             if update.alert_level not in ("off", "digest", "realtime"):
@@ -921,6 +921,173 @@ async def delete_notification(notif_id: int, user_id: int = Depends(get_current_
 #   v0.1.3 → Greenhouse (per-employer feeds for watched companies)
 
 
+# ── USAJobs normalization helpers ─────────────────────────────────────────────
+# Maps a single USAJobs SearchResultItem into the dict shape pv_jobs expects,
+# plus the OPM occupational-series → sector and GS-grade → level mappings.
+
+def _usajobs_sector_for_series(code) -> str:
+    """OPM occupational series → one of our 12 sector slugs. All USAJobs
+    postings are federal, so 'government' is the catch-all default."""
+    if not code:
+        return "government"
+    c = str(code).zfill(4)
+    # 22XX = IT family (Information Technology Management etc.)
+    if c.startswith("22"):
+        return "it"
+    # 0810 (Civil Engineering) + 0828 (Construction Analyst) → construction
+    if c in ("0810", "0828"):
+        return "construction"
+    # 08XX = Engineering family
+    if c.startswith("08"):
+        return "engineering"
+    # Legal: 0901 (General Legal), 0904 (Law Clerk), 0905 (General Attorney)
+    if c in ("0901", "0904", "0905"):
+        return "legal"
+    # Healthcare: Medical Officer, Nurse, Pharmacist, Dental, Health Tech families
+    if c in ("0602", "0610", "0660", "0680", "0640", "0644", "0671", "0699"):
+        return "healthcare"
+    # 05XX = Accounting and Budget family
+    if c.startswith("05"):
+        return "finance"
+    # 17XX = Education family
+    if c.startswith("17"):
+        return "education"
+    # 02XX = Human Resources family
+    if c.startswith("02"):
+        return "hr"
+    # 1083 = Public Affairs (closest federal match for Marketing/PR)
+    if c == "1083":
+        return "marketing"
+    # 1170 = Realty (closest federal match for Sales)
+    if c == "1170":
+        return "sales"
+    return "government"
+
+
+def _usajobs_level_from_title(title: str) -> str:
+    """Parse GS-NN grade from the position title and bucket into our four
+    levels. Falls back to keyword scan, then 'mid' as default."""
+    if not title:
+        return "mid"
+    t = title.upper()
+    # Senior Executive Service / Executive Service.
+    if " SES" in t or "(SES)" in t or " ES-" in t or t.endswith(" ES"):
+        return "executive"
+    # GS-NN pattern (also matches GS NN and GSNN).
+    m = re.search(r"GS[\s\-]?(\d{1,2})", t)
+    if m:
+        try:
+            grade = int(m.group(1))
+            if grade <= 7:
+                return "entry"
+            if grade <= 12:
+                return "mid"
+            if grade <= 14:
+                return "senior"
+            return "executive"
+        except Exception:
+            pass
+    # Title-keyword fallback.
+    if any(w in t for w in ["INTERN", "TRAINEE", "STUDENT", "JUNIOR", "ENTRY LEVEL"]):
+        return "entry"
+    if any(w in t for w in ["DIRECTOR", "CHIEF", "EXECUTIVE", "VICE PRESIDENT"]):
+        return "executive"
+    if any(w in t for w in ["SENIOR", "PRINCIPAL", "LEAD"]):
+        return "senior"
+    return "mid"
+
+
+def _normalize_usajobs_item(item: dict) -> Optional[dict]:
+    """Map one USAJobs SearchResultItem into the pv_jobs dict shape, or None
+    if essential fields are missing."""
+    desc = item.get("MatchedObjectDescriptor") or {}
+    external_id = item.get("MatchedObjectId") or desc.get("PositionID")
+    if not external_id:
+        return None
+
+    title = desc.get("PositionTitle") or ""
+    company = desc.get("OrganizationName") or desc.get("DepartmentName") or ""
+
+    # Location: take the first entry of PositionLocation. Multi-site postings
+    # exist; for v0.1.1 we anchor on the first.
+    locations = desc.get("PositionLocation") or []
+    loc = locations[0] if locations else {}
+    location_name = (loc.get("LocationName")
+                     or desc.get("PositionLocationDisplay")
+                     or "")
+    lat = loc.get("Latitude")
+    lng = loc.get("Longitude")
+    try:
+        lat = float(lat) if lat not in (None, "", 0, "0", 0.0) else None
+        lng = float(lng) if lng not in (None, "", 0, "0", 0.0) else None
+    except Exception:
+        lat = None
+        lng = None
+
+    # Remote: UserArea.Details.RemoteIndicator boolean.
+    details = (desc.get("UserArea") or {}).get("Details") or {}
+    is_remote = bool(details.get("RemoteIndicator"))
+
+    # Salary: take PositionRemuneration[0]. Convert hourly to annual (×2080)
+    # so the frontend formatSalary stays consistent across sources.
+    rem = desc.get("PositionRemuneration") or []
+    salary_min = None
+    salary_max = None
+    if rem:
+        r = rem[0] or {}
+        try:
+            interval = (r.get("RateIntervalCode") or "").strip()
+            mult = 2080.0 if interval == "PH" else 1.0
+            sm = r.get("MinimumRange")
+            xm = r.get("MaximumRange")
+            if sm not in (None, ""):
+                salary_min = float(sm) * mult
+            if xm not in (None, ""):
+                salary_max = float(xm) * mult
+        except Exception:
+            salary_min = None
+            salary_max = None
+
+    # Sector mapping from JobCategory[0].Code.
+    cats = desc.get("JobCategory") or []
+    series_code = cats[0].get("Code") if cats else ""
+    sector = _usajobs_sector_for_series(series_code)
+
+    # Level from title (GS-NN or SES/keyword).
+    level = _usajobs_level_from_title(title)
+
+    # Posted date — USAJobs returns YYYY-MM-DD.
+    posted_at = desc.get("PublicationStartDate")
+
+    # URL: PositionURI is the canonical viewable link.
+    url = desc.get("PositionURI") or ""
+
+    # Description: cap at 2KB to keep raw_payload manageable.
+    description = (details.get("JobSummary") or "")
+    if description and len(description) > 2000:
+        description = description[:2000] + "…"
+
+    return {
+        "source": "usajobs",
+        "external_id": str(external_id),
+        "title": title,
+        "company": company,
+        "sector": sector,
+        "level": level,
+        "location_name": location_name,
+        "lat": lat,
+        "lng": lng,
+        "is_remote": is_remote,
+        "salary_min": salary_min,
+        "salary_max": salary_max,
+        "salary_currency": "USD",
+        "description": description,
+        "url": url,
+        "posted_at": posted_at,
+        "raw": desc,
+    }
+
+
 class Sources:
     """All job feed adapters. Each fetch_* returns a list of normalized job dicts."""
 
@@ -942,13 +1109,60 @@ class Sources:
             return None
 
     # ── USAJobs (federal jobs, free, requires API key + email as User-Agent) ──
-    # Stub for v0.1.0. v0.1.1 will pull from
+    # Stub for v0.1.0. v0.1.1+ pulls from
     # https://data.usajobs.gov/api/search with these env vars:
     #   USAJOBS_API_KEY        -- request at developer.usajobs.gov
     #   USAJOBS_USER_AGENT     -- the email you registered with
     @staticmethod
     def fetch_usajobs() -> List[dict]:
-        return []
+        api_key = (os.environ.get("USAJOBS_API_KEY") or "").strip()
+        user_agent = (os.environ.get("USAJOBS_USER_AGENT") or "").strip()
+        if not api_key or not user_agent:
+            print("[usajobs] USAJOBS_API_KEY or USAJOBS_USER_AGENT not set; skipping")
+            return []
+
+        headers = {
+            "Host": "data.usajobs.gov",
+            "User-Agent": user_agent,
+            "Authorization-Key": api_key,
+            "Accept": "application/json",
+        }
+
+        out = []
+        max_pages = 5
+        results_per_page = 500
+
+        for page in range(1, max_pages + 1):
+            url = ("https://data.usajobs.gov/api/search"
+                   + "?ResultsPerPage=" + str(results_per_page)
+                   + "&Page=" + str(page))
+            try:
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json_lib.loads(resp.read().decode("utf-8", errors="replace"))
+            except Exception as e:
+                print("[usajobs] page " + str(page) + " fetch failed: " + str(e))
+                break
+
+            search_result = data.get("SearchResult") or {}
+            items = search_result.get("SearchResultItems") or []
+            if not items:
+                break
+
+            for item in items:
+                try:
+                    normalized = _normalize_usajobs_item(item)
+                    if normalized:
+                        out.append(normalized)
+                except Exception as e:
+                    print("[usajobs] normalize failed: " + str(e))
+
+            # Last page if we got fewer than a full page back.
+            if len(items) < results_per_page:
+                break
+
+        print("[usajobs] fetched " + str(len(out)) + " jobs")
+        return out
 
     # ── Adzuna (US private-board aggregator, free with key) ───────────────────
     # Stub for v0.1.0. v0.1.2 will pull from
