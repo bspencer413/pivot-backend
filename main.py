@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -648,30 +648,38 @@ async def get_search_jobs(search_id: int, user_id: int = Depends(get_current_use
         s_radius = search[8]
 
         # Filter-match query. Each filter is "NULL = any"; location branches on
-        # radius_value. Sort is recency only (no severity concept for jobs).
+        # radius_value. DISTINCT ON collapses identical postings (USAJobs often
+        # publishes the same role at multiple grades or duty-station variants
+        # under separate MatchedObjectIds -- to the user they're the same job).
+        # The dedupe key is (lower(title), lower(company), location_name);
+        # within a dedupe group we keep the most-recently-posted row.
         c.execute("""
-            SELECT j.id, j.source, j.external_id, j.title, j.company, j.sector, j.level,
-                   j.location_name, j.lat, j.lng, j.is_remote,
-                   j.salary_min, j.salary_max, j.salary_currency,
-                   j.description, j.url, j.posted_at,
-                   CASE
-                     WHEN s.geom IS NOT NULL AND j.geom IS NOT NULL
-                     THEN ST_Distance(j.geom, s.geom) / 1609.344
-                     ELSE NULL
-                   END AS distance_mi
-            FROM pv_jobs j, pv_searches s
-            WHERE s.id = %s
-              AND (s.company IS NULL OR j.company ILIKE '%%' || s.company || '%%')
-              AND (s.sector IS NULL OR j.sector = s.sector)
-              AND (s.level IS NULL OR j.level = s.level)
-              AND (
-                (s.radius_value = 'remote' AND j.is_remote = TRUE)
-                OR
-                (s.radius_value != 'remote' AND s.geom IS NOT NULL AND j.geom IS NOT NULL
-                 AND ST_DWithin(j.geom, s.geom, (s.radius_value::int) * 1609.344))
-              )
-              AND j.fetched_at > NOW() - INTERVAL '3 days'
-            ORDER BY j.posted_at DESC
+            SELECT * FROM (
+              SELECT DISTINCT ON (LOWER(j.title), LOWER(COALESCE(j.company,'')), COALESCE(j.location_name,''))
+                     j.id, j.source, j.external_id, j.title, j.company, j.sector, j.level,
+                     j.location_name, j.lat, j.lng, j.is_remote,
+                     j.salary_min, j.salary_max, j.salary_currency,
+                     j.description, j.url, j.posted_at,
+                     CASE
+                       WHEN s.geom IS NOT NULL AND j.geom IS NOT NULL
+                       THEN ST_Distance(j.geom, s.geom) / 1609.344
+                       ELSE NULL
+                     END AS distance_mi
+              FROM pv_jobs j, pv_searches s
+              WHERE s.id = %s
+                AND (s.company IS NULL OR j.company ILIKE '%%' || s.company || '%%')
+                AND (s.sector IS NULL OR j.sector = s.sector)
+                AND (s.level IS NULL OR j.level = s.level)
+                AND (
+                  (s.radius_value = 'remote' AND j.is_remote = TRUE)
+                  OR
+                  (s.radius_value != 'remote' AND s.geom IS NOT NULL AND j.geom IS NOT NULL
+                   AND ST_DWithin(j.geom, s.geom, (s.radius_value::int) * 1609.344))
+                )
+                AND j.fetched_at > NOW() - INTERVAL '3 days'
+              ORDER BY LOWER(j.title), LOWER(COALESCE(j.company,'')), COALESCE(j.location_name,''), j.posted_at DESC
+            ) dedup
+            ORDER BY posted_at DESC NULLS LAST
             LIMIT 50
         """, (search_id,))
 
