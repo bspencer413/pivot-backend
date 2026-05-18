@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.17"
+VERSION = "0.1.18"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -1691,10 +1691,24 @@ def _normalize_adzuna_item(item: dict) -> Optional[dict]:
         lng = None
         state = None
 
-    # Remote detection: Adzuna doesn't have a structured flag. Check title
-    # and location strings for the "remote" keyword.
+    # Remote detection: Adzuna doesn't have a structured flag. Use explicit
+    # WFH phrases rather than the bare word "remote" -- which over-fires on
+    # job titles like "Remote Lodge Manager", "Remote Field Engineer",
+    # "Remote-site Operations", and even the actual town of Remote, Oregon.
+    # We accept false negatives (missing a few true remote jobs whose copy
+    # doesn't use these phrases) in exchange for far fewer false positives.
     combined = (title + " " + location_name).lower()
-    is_remote = "remote" in combined or "work from home" in combined or "wfh" in combined
+    REMOTE_PHRASES = (
+        "work from home", "wfh", "work-from-home",
+        "fully remote", "100% remote", "100 % remote",
+        "remote work", "remote position", "remote role",
+        "remote job", "remote opportunity", "remote-first",
+        "remote first", "work remotely", "working remotely",
+        "telecommute", "telework", "telecommuting",
+        "remote (us)", "remote, us", "remote, united states",
+        "remote usa", "remote - us", "remote – us",
+    )
+    is_remote = any(p in combined for p in REMOTE_PHRASES)
 
     # Salary: salary_min, salary_max as floats. Already in annual USD.
     salary_min = item.get("salary_min")
