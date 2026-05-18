@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.8"
+VERSION = "0.1.10"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -198,6 +198,22 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_pv_jobs_sector ON pv_jobs (sector)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_pv_jobs_level ON pv_jobs (level)")
 
+    # ── v0.1.10 schema additions: where_mode + state filters ─────────────────
+    # pv_searches.where_mode: 'address' | 'state' | 'anywhere'
+    # pv_searches.state_code: 2-letter US state code, populated only when
+    #                          where_mode = 'state'
+    # pv_jobs.state: 2-letter US state code extracted at ingest time from
+    #                the source's location string. Enables state-mode matching
+    #                without expensive geocoding per query.
+    c.execute("ALTER TABLE pv_searches ADD COLUMN IF NOT EXISTS where_mode TEXT NOT NULL DEFAULT 'address'")
+    c.execute("ALTER TABLE pv_searches ADD COLUMN IF NOT EXISTS state_code CHAR(2)")
+    c.execute("ALTER TABLE pv_jobs ADD COLUMN IF NOT EXISTS state CHAR(2)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pv_jobs_state ON pv_jobs (state)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pv_searches_where_mode ON pv_searches (where_mode)")
+    # Backfill: existing rows with radius_value='remote' become anywhere-mode.
+    # Idempotent — only flips rows that haven't been migrated yet.
+    c.execute("UPDATE pv_searches SET where_mode = 'anywhere' WHERE radius_value = 'remote' AND where_mode = 'address'")
+
     # Job matches: every (job, search) pair where the job satisfied the search
     # filters AND geofence. UNIQUE prevents double-alerting on rerun.
     c.execute("""CREATE TABLE IF NOT EXISTS pv_job_matches (
@@ -290,10 +306,12 @@ class SearchItem(BaseModel):
     company: Optional[str] = None        # NULL = any
     sector: Optional[str] = None         # NULL = any
     level: Optional[str] = None          # entry | mid | senior | executive | None=any
-    location_name: Optional[str] = None  # human-readable; NULL if radius='remote'
-    lat: Optional[float] = None          # required if radius != 'remote'
-    lng: Optional[float] = None          # required if radius != 'remote'
-    radius_value: str = "25"             # '5' | '10' | '25' | '50' | 'remote'
+    location_name: Optional[str] = None  # human-readable; NULL for anywhere/state
+    lat: Optional[float] = None          # required if where_mode='address'
+    lng: Optional[float] = None          # required if where_mode='address'
+    radius_value: str = "25"             # '1' | '5' | '10' | '25' (only used in address mode)
+    where_mode: Optional[str] = None     # 'address' | 'state' | 'anywhere'; None = derive from radius_value
+    state_code: Optional[str] = None     # 2-letter US state code; required when where_mode='state'
     alert_level: Optional[str] = "realtime"  # off | digest | realtime
 
 class SearchUpdate(BaseModel):
@@ -305,6 +323,8 @@ class SearchUpdate(BaseModel):
     lat: Optional[float] = None
     lng: Optional[float] = None
     radius_value: Optional[str] = None
+    where_mode: Optional[str] = None
+    state_code: Optional[str] = None
     alert_level: Optional[str] = None
     is_archived: Optional[bool] = None
     in_my_searches: Optional[bool] = None
@@ -319,6 +339,8 @@ class SearchResponse(BaseModel):
     lat: Optional[float]
     lng: Optional[float]
     radius_value: str
+    where_mode: str
+    state_code: Optional[str]
     alert_level: str
     is_archived: bool
     in_my_searches: bool
@@ -418,6 +440,90 @@ async def admin_check_now():
     return {"message": "pivot.watch check cycle started"}
 
 
+@app.get("/admin/inspect")
+async def admin_inspect(sector: Optional[str] = None, source: Optional[str] = None, limit: int = 20):
+    """Diagnostic endpoint. Returns (a) (source, sector) breakdown counts across
+    all of pv_jobs, plus (b) a sample of recently-fetched jobs matching optional
+    filters. Used to verify what the cron actually ingested vs what the drawer
+    SQL is filtering against."""
+    with get_db() as conn:
+        c = conn.cursor()
+
+        # Full breakdown by source × sector — every bucket with rows.
+        c.execute("""
+            SELECT source, COALESCE(sector, '(null)') AS sector, COUNT(*)
+            FROM pv_jobs
+            GROUP BY source, COALESCE(sector, '(null)')
+            ORDER BY source, sector
+        """)
+        breakdown = [{"source": r[0], "sector": r[1], "count": r[2]} for r in c.fetchall()]
+
+        # How many jobs have valid lat/lng (j.geom IS NOT NULL).
+        c.execute("SELECT source, COUNT(*) FROM pv_jobs WHERE geom IS NOT NULL GROUP BY source")
+        geom_by_source = {r[0]: r[1] for r in c.fetchall()}
+
+        # Recent fetched_at distribution.
+        c.execute("""
+            SELECT
+              COUNT(*) FILTER (WHERE fetched_at > NOW() - INTERVAL '1 hour') AS hr1,
+              COUNT(*) FILTER (WHERE fetched_at > NOW() - INTERVAL '1 day')  AS d1,
+              COUNT(*) FILTER (WHERE fetched_at > NOW() - INTERVAL '3 days') AS d3,
+              COUNT(*) FILTER (WHERE fetched_at > NOW() - INTERVAL '7 days') AS d7
+            FROM pv_jobs
+        """)
+        freshness_row = c.fetchone()
+        freshness = {
+            "fetched_last_hour": freshness_row[0],
+            "fetched_last_day":  freshness_row[1],
+            "fetched_last_3d":   freshness_row[2],
+            "fetched_last_7d":   freshness_row[3],
+        }
+
+        # Sample matching the filters, most-recently-fetched first.
+        where_sql = []
+        params = []
+        if sector:
+            where_sql.append("sector = %s")
+            params.append(sector)
+        if source:
+            where_sql.append("source = %s")
+            params.append(source)
+        where_clause = (" WHERE " + " AND ".join(where_sql)) if where_sql else ""
+
+        c.execute(
+            "SELECT id, source, company, title, sector, level, location_name, "
+            "lat, lng, is_remote, posted_at, fetched_at "
+            "FROM pv_jobs" + where_clause + " "
+            "ORDER BY fetched_at DESC LIMIT %s",
+            params + [limit]
+        )
+        samples = []
+        for r in c.fetchall():
+            samples.append({
+                "id": r[0],
+                "source": r[1],
+                "company": r[2],
+                "title": r[3],
+                "sector": r[4],
+                "level": r[5],
+                "location_name": r[6],
+                "lat": float(r[7]) if r[7] is not None else None,
+                "lng": float(r[8]) if r[8] is not None else None,
+                "is_remote": r[9],
+                "posted_at": r[10].isoformat() if r[10] else None,
+                "fetched_at": r[11].isoformat() if r[11] else None,
+            })
+
+        return {
+            "filter_applied": {"sector": sector, "source": source, "limit": limit},
+            "breakdown_by_source_sector": breakdown,
+            "rows_with_valid_geom_by_source": geom_by_source,
+            "freshness": freshness,
+            "sample_count": len(samples),
+            "samples": samples,
+        }
+
+
 @app.get("/admin/who-owns-what")
 async def admin_who_owns_what():
     """Debug endpoint: show every user and how many searches they own (active + archived).
@@ -497,7 +603,8 @@ async def list_searches(user_id: int = Depends(get_current_user)):
         c = conn.cursor()
         c.execute("""
             SELECT id, name, company, sector, level, location_name, lat, lng,
-                   radius_value, alert_level, is_archived, in_my_searches, created_at
+                   radius_value, where_mode, state_code,
+                   alert_level, is_archived, in_my_searches, created_at
             FROM pv_searches
             WHERE user_id = %s
             ORDER BY created_at DESC
@@ -514,28 +621,68 @@ async def list_searches(user_id: int = Depends(get_current_user)):
                 "lat": float(row[6]) if row[6] is not None else None,
                 "lng": float(row[7]) if row[7] is not None else None,
                 "radius_value": row[8],
-                "alert_level": row[9],
-                "is_archived": bool(row[10]),
-                "in_my_searches": bool(row[11]),
-                "created_at": str(row[12]),
+                "where_mode": row[9] or "address",
+                "state_code": row[10],
+                "alert_level": row[11],
+                "is_archived": bool(row[12]),
+                "in_my_searches": bool(row[13]),
+                "created_at": str(row[14]),
             })
         return items
 
 
 @app.post("/pv/searches")
 async def add_search(item: SearchItem, user_id: int = Depends(get_current_user)):
-    # Validate radius_value.
-    if item.radius_value not in ("1", "5", "10", "25", "50", "remote"):
-        raise HTTPException(status_code=400, detail="radius_value must be 1/5/10/25/remote")
-    # Lat/lng required unless radius is remote.
-    if item.radius_value != "remote":
-        if item.lat is None or item.lng is None:
-            raise HTTPException(status_code=400, detail="lat/lng required when radius is not 'remote'")
-        if item.lat < -90 or item.lat > 90:
+    # Backward-compat: frontend v0.1.9 still sends radius_value='remote' to mean
+    # "anywhere". Translate that into the new where_mode model before validating.
+    where_mode = (item.where_mode or "").strip().lower()
+    state_code = (item.state_code or "").strip().upper() or None
+    radius_value = item.radius_value
+    lat = item.lat
+    lng = item.lng
+    location_name = item.location_name
+
+    if not where_mode:
+        # Derive from radius_value if frontend hasn't supplied where_mode yet.
+        if radius_value == "remote":
+            where_mode = "anywhere"
+            radius_value = "25"  # sentinel; ignored by drawer SQL in anywhere mode
+            lat = None
+            lng = None
+            location_name = None
+        else:
+            where_mode = "address"
+
+    if where_mode not in ("address", "state", "anywhere"):
+        raise HTTPException(status_code=400, detail="where_mode must be address/state/anywhere")
+
+    # Validate radius_value (only meaningful in address mode but always populated).
+    if radius_value not in ("1", "5", "10", "25"):
+        if where_mode == "address":
+            raise HTTPException(status_code=400, detail="radius_value must be 1/5/10/25")
+        radius_value = "25"  # harmless default for state/anywhere modes
+
+    # Per-mode validation.
+    if where_mode == "address":
+        if lat is None or lng is None:
+            raise HTTPException(status_code=400, detail="lat/lng required when where_mode='address'")
+        if lat < -90 or lat > 90:
             raise HTTPException(status_code=400, detail="lat must be between -90 and 90")
-        if item.lng < -180 or item.lng > 180:
+        if lng < -180 or lng > 180:
             raise HTTPException(status_code=400, detail="lng must be between -180 and 180")
-    # Validate level if provided.
+        state_code = None  # not used in address mode
+    elif where_mode == "state":
+        if not state_code or state_code not in _US_STATE_CODES:
+            raise HTTPException(status_code=400, detail="state_code (2-letter US) required when where_mode='state'")
+        lat = None
+        lng = None
+        location_name = None
+    else:  # anywhere
+        state_code = None
+        lat = None
+        lng = None
+        location_name = None
+
     if item.level and item.level not in ("entry", "mid", "senior", "executive"):
         raise HTTPException(status_code=400, detail="level must be entry/mid/senior/executive")
     alert_level = item.alert_level or "realtime"
@@ -545,11 +692,13 @@ async def add_search(item: SearchItem, user_id: int = Depends(get_current_user))
         c = conn.cursor()
         c.execute("""
             INSERT INTO pv_searches (user_id, name, company, sector, level,
-                                     location_name, lat, lng, radius_value, alert_level)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                                     location_name, lat, lng, radius_value,
+                                     where_mode, state_code, alert_level)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id, created_at
         """, (user_id, item.name, item.company, item.sector, item.level,
-              item.location_name, item.lat, item.lng, item.radius_value, alert_level))
+              location_name, lat, lng, radius_value,
+              where_mode, state_code, alert_level))
         row = c.fetchone()
         conn.commit()
         return {
@@ -559,10 +708,12 @@ async def add_search(item: SearchItem, user_id: int = Depends(get_current_user))
             "company": item.company,
             "sector": item.sector,
             "level": item.level,
-            "location_name": item.location_name,
-            "lat": item.lat,
-            "lng": item.lng,
-            "radius_value": item.radius_value,
+            "location_name": location_name,
+            "lat": lat,
+            "lng": lng,
+            "radius_value": radius_value,
+            "where_mode": where_mode,
+            "state_code": state_code,
             "alert_level": alert_level,
             "is_archived": False,
             "in_my_searches": False,
@@ -596,9 +747,40 @@ async def update_search(search_id: int, update: SearchUpdate, user_id: int = Dep
         if update.lng is not None:
             sets.append("lng = %s"); params.append(update.lng)
         if update.radius_value is not None:
-            if update.radius_value not in ("1", "5", "10", "25", "50", "remote"):
-                raise HTTPException(status_code=400, detail="radius_value must be 1/5/10/25/remote")
-            sets.append("radius_value = %s"); params.append(update.radius_value)
+            # Backward-compat: PATCH radius_value='remote' from v0.1.9 frontend
+            # → translate to where_mode='anywhere' + sensible radius_value default.
+            if update.radius_value == "remote":
+                sets.append("where_mode = %s"); params.append("anywhere")
+                sets.append("radius_value = %s"); params.append("25")
+                sets.append("lat = %s"); params.append(None)
+                sets.append("lng = %s"); params.append(None)
+                sets.append("location_name = %s"); params.append(None)
+                sets.append("state_code = %s"); params.append(None)
+            elif update.radius_value in ("1", "5", "10", "25"):
+                sets.append("radius_value = %s"); params.append(update.radius_value)
+                # If frontend doesn't also send where_mode, treat as address mode.
+                if update.where_mode is None:
+                    sets.append("where_mode = %s"); params.append("address")
+                    sets.append("state_code = %s"); params.append(None)
+            else:
+                raise HTTPException(status_code=400, detail="radius_value must be 1/5/10/25")
+        if update.where_mode is not None:
+            wm = update.where_mode.strip().lower()
+            if wm not in ("address", "state", "anywhere"):
+                raise HTTPException(status_code=400, detail="where_mode must be address/state/anywhere")
+            sets.append("where_mode = %s"); params.append(wm)
+            if wm != "address":
+                # Clear lat/lng when leaving address mode.
+                sets.append("lat = %s"); params.append(None)
+                sets.append("lng = %s"); params.append(None)
+                sets.append("location_name = %s"); params.append(None)
+            if wm != "state":
+                sets.append("state_code = %s"); params.append(None)
+        if update.state_code is not None:
+            sc = update.state_code.strip().upper() or None
+            if sc and sc not in _US_STATE_CODES:
+                raise HTTPException(status_code=400, detail="state_code must be a valid 2-letter US state")
+            sets.append("state_code = %s"); params.append(sc)
         if update.alert_level is not None:
             if update.alert_level not in ("off", "digest", "realtime"):
                 raise HTTPException(status_code=400, detail="alert_level must be off/digest/realtime")
@@ -671,10 +853,24 @@ async def get_search_jobs(search_id: int, user_id: int = Depends(get_current_use
                 AND (s.sector IS NULL OR j.sector = s.sector)
                 AND (s.level IS NULL OR j.level = s.level)
                 AND (
-                  (s.radius_value = 'remote' AND j.is_remote = TRUE)
+                  -- where_mode='address': within radius miles of saved point,
+                  -- OR job is remote-classified (location-agnostic).
+                  (s.where_mode = 'address' AND (
+                    j.is_remote = TRUE
+                    OR (s.geom IS NOT NULL AND j.geom IS NOT NULL
+                        AND ST_DWithin(j.geom, s.geom,
+                                       COALESCE(NULLIF(s.radius_value, 'remote'), '25')::int * 1609.344))
+                  ))
                   OR
-                  (s.radius_value != 'remote' AND s.geom IS NOT NULL AND j.geom IS NOT NULL
-                   AND ST_DWithin(j.geom, s.geom, NULLIF(s.radius_value, 'remote')::int * 1609.344))
+                  -- where_mode='state': job's state matches search's state,
+                  -- OR job is remote-classified.
+                  (s.where_mode = 'state' AND (
+                    j.is_remote = TRUE
+                    OR j.state = s.state_code
+                  ))
+                  OR
+                  -- where_mode='anywhere': no geographic predicate at all.
+                  (s.where_mode = 'anywhere')
                 )
                 AND j.fetched_at > NOW() - INTERVAL '3 days'
               ORDER BY LOWER(j.title), LOWER(COALESCE(j.company,'')), COALESCE(j.location_name,''), j.posted_at DESC
@@ -1069,6 +1265,16 @@ def _normalize_usajobs_item(item: dict) -> Optional[dict]:
         lat = None
         lng = None
 
+    # State extraction: USAJobs exposes CountrySubDivisionCode (full state name
+    # like "Hawaii") on the first PositionLocation. Fall back to parsing the
+    # composed location_name string if that field is missing.
+    state = None
+    csdc = (loc.get("CountrySubDivisionCode") or "").strip().lower()
+    if csdc:
+        state = US_STATE_NAME_TO_CODE.get(csdc)
+    if not state:
+        state = _extract_state_code(location_name)
+
     # Remote: UserArea.Details.RemoteIndicator boolean.
     details = (desc.get("UserArea") or {}).get("Details") or {}
     is_remote = bool(details.get("RemoteIndicator"))
@@ -1122,6 +1328,7 @@ def _normalize_usajobs_item(item: dict) -> Optional[dict]:
         "location_name": location_name,
         "lat": lat,
         "lng": lng,
+        "state": state,
         "is_remote": is_remote,
         "salary_min": salary_min,
         "salary_max": salary_max,
@@ -1197,6 +1404,58 @@ def _level_from_title_keywords(title: str) -> str:
     return "mid"
 
 
+# ── State extraction (v0.1.10) ────────────────────────────────────────────────
+# Map of full US state names (lowercase) → 2-letter code. Used by all source
+# normalizers to populate pv_jobs.state at ingest, which in turn powers the
+# 'state' where_mode in pv_searches filtering.
+US_STATE_NAME_TO_CODE = {
+    "alabama": "AL", "alaska": "AK", "arizona": "AZ", "arkansas": "AR",
+    "california": "CA", "colorado": "CO", "connecticut": "CT", "delaware": "DE",
+    "district of columbia": "DC", "florida": "FL", "georgia": "GA",
+    "hawaii": "HI", "idaho": "ID", "illinois": "IL", "indiana": "IN",
+    "iowa": "IA", "kansas": "KS", "kentucky": "KY", "louisiana": "LA",
+    "maine": "ME", "maryland": "MD", "massachusetts": "MA", "michigan": "MI",
+    "minnesota": "MN", "mississippi": "MS", "missouri": "MO", "montana": "MT",
+    "nebraska": "NE", "nevada": "NV", "new hampshire": "NH", "new jersey": "NJ",
+    "new mexico": "NM", "new york": "NY", "north carolina": "NC",
+    "north dakota": "ND", "ohio": "OH", "oklahoma": "OK", "oregon": "OR",
+    "pennsylvania": "PA", "rhode island": "RI", "south carolina": "SC",
+    "south dakota": "SD", "tennessee": "TN", "texas": "TX", "utah": "UT",
+    "vermont": "VT", "virginia": "VA", "washington": "WA",
+    "west virginia": "WV", "wisconsin": "WI", "wyoming": "WY",
+    "puerto rico": "PR", "guam": "GU", "u.s. virgin islands": "VI",
+    "american samoa": "AS", "northern mariana islands": "MP",
+}
+_US_STATE_CODES = set(US_STATE_NAME_TO_CODE.values())
+
+
+def _extract_state_code(text) -> Optional[str]:
+    """Extract a 2-letter US state code from a free-text location string.
+    Tries (in order): explicit 2-letter code at end after comma; full state
+    name match. Returns None if nothing recognized — caller is responsible
+    for leaving pv_jobs.state NULL in that case."""
+    if not text:
+        return None
+    s = str(text).strip()
+    if not s:
+        return None
+    # Pattern 1: ", XX" or ", XX " at the end / before a space — handles
+    # "Honolulu, HI", "New York, NY 10001", "Washington, DC - Remote", etc.
+    m = re.search(r",\s*([A-Z]{2})\b", s)
+    if m and m.group(1) in _US_STATE_CODES:
+        return m.group(1)
+    # Pattern 2: full state name anywhere in the string (case-insensitive).
+    # Sort by length descending so "new york" matches before "new" alone.
+    low = s.lower()
+    for name in sorted(US_STATE_NAME_TO_CODE.keys(), key=len, reverse=True):
+        # Word-boundary match to avoid "indiana" inside "indianapolis"... well
+        # actually that's fine, indianapolis IS in indiana. But "ohio" inside
+        # "ohiopyle" or "iowa" inside "iowan" could mislead. Use word boundary.
+        if re.search(r"\b" + re.escape(name) + r"\b", low):
+            return US_STATE_NAME_TO_CODE[name]
+    return None
+
+
 def _normalize_adzuna_item(item: dict) -> Optional[dict]:
     """Map one Adzuna /search result into the pv_jobs dict shape, or None
     if essential fields are missing."""
@@ -1227,6 +1486,17 @@ def _normalize_adzuna_item(item: dict) -> Optional[dict]:
     except Exception:
         lat = None
         lng = None
+
+    # State extraction: Adzuna's location.area is structured like
+    # ["US", "Hawaii", "Honolulu"] -- the second element is the state name.
+    # Fall back to parsing the display_name if area isn't usable.
+    state = None
+    if isinstance(loc, dict):
+        area = loc.get("area")
+        if isinstance(area, list) and len(area) >= 2:
+            state = US_STATE_NAME_TO_CODE.get((area[1] or "").strip().lower())
+    if not state:
+        state = _extract_state_code(location_name)
 
     # Remote detection: Adzuna doesn't have a structured flag. Check title
     # and location strings for the "remote" keyword.
@@ -1274,6 +1544,7 @@ def _normalize_adzuna_item(item: dict) -> Optional[dict]:
         "location_name": location_name,
         "lat": lat,
         "lng": lng,
+        "state": state,
         "is_remote": is_remote,
         "salary_min": salary_min,
         "salary_max": salary_max,
@@ -1486,6 +1757,10 @@ def _normalize_greenhouse_item(job: dict, queried_company: str) -> Optional[dict
     # Posted at: updated_at is the most useful timestamp Greenhouse exposes.
     posted_at = job.get("updated_at") or job.get("first_published")
 
+    # State extraction: location_name is free-text per employer
+    # ("Honolulu, HI", "New York, NY", "Remote, US", etc).
+    state = _extract_state_code(location_name)
+
     return {
         "source": "greenhouse",
         "external_id": str(job_id),
@@ -1496,6 +1771,7 @@ def _normalize_greenhouse_item(job: dict, queried_company: str) -> Optional[dict
         "location_name": location_name,
         "lat": lat,
         "lng": lng,
+        "state": state,
         "is_remote": is_remote,
         "salary_min": None,           # Greenhouse doesn't expose salary
         "salary_max": None,
@@ -1733,12 +2009,12 @@ def upsert_jobs(conn, normalized: List[dict]) -> List[int]:
             c.execute("""
                 INSERT INTO pv_jobs (
                     source, external_id, title, company, sector, level,
-                    location_name, lat, lng, is_remote,
+                    location_name, lat, lng, state, is_remote,
                     salary_min, salary_max, salary_currency,
                     description, url, posted_at, raw_payload, geom
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
+                    %s, %s, %s, %s, %s,
                     %s, %s, %s,
                     %s, %s, %s, %s::jsonb,
                     CASE WHEN %s IS NOT NULL
@@ -1753,6 +2029,7 @@ def upsert_jobs(conn, normalized: List[dict]) -> List[int]:
                     location_name = EXCLUDED.location_name,
                     lat = EXCLUDED.lat,
                     lng = EXCLUDED.lng,
+                    state = EXCLUDED.state,
                     is_remote = EXCLUDED.is_remote,
                     salary_min = EXCLUDED.salary_min,
                     salary_max = EXCLUDED.salary_max,
@@ -1767,7 +2044,7 @@ def upsert_jobs(conn, normalized: List[dict]) -> List[int]:
             """, (
                 j["source"], j["external_id"], j.get("title"), j.get("company"),
                 j.get("sector"), j.get("level"),
-                j.get("location_name"), j.get("lat"), j.get("lng"),
+                j.get("location_name"), j.get("lat"), j.get("lng"), j.get("state"),
                 bool(j.get("is_remote") or False),
                 j.get("salary_min"), j.get("salary_max"), j.get("salary_currency"),
                 j.get("description"), j.get("url"), j.get("posted_at"),
@@ -1812,10 +2089,19 @@ def filter_match_and_alert(conn, new_job_ids: List[int]) -> int:
          AND (s.sector  IS NULL OR j.sector = s.sector)
          AND (s.level   IS NULL OR j.level  = s.level)
          AND (
-              (s.radius_value = 'remote' AND j.is_remote = TRUE)
+              (s.where_mode = 'address' AND (
+                j.is_remote = TRUE
+                OR (s.geom IS NOT NULL AND j.geom IS NOT NULL
+                    AND ST_DWithin(j.geom, s.geom,
+                                   COALESCE(NULLIF(s.radius_value, 'remote'), '25')::int * 1609.344))
+              ))
               OR
-              (s.radius_value != 'remote' AND s.geom IS NOT NULL AND j.geom IS NOT NULL
-               AND ST_DWithin(j.geom, s.geom, NULLIF(s.radius_value, 'remote')::int * 1609.344))
+              (s.where_mode = 'state' AND (
+                j.is_remote = TRUE
+                OR j.state = s.state_code
+              ))
+              OR
+              (s.where_mode = 'anywhere')
          )
         WHERE j.id = ANY(%s)
         ON CONFLICT (job_id, search_id) DO NOTHING
