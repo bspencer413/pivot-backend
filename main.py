@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.14"
+VERSION = "0.1.15"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -956,7 +956,8 @@ async def get_search_jobs(search_id: int, user_id: int = Depends(get_current_use
     with get_db() as conn:
         c = conn.cursor()
         c.execute("""SELECT id, name, company, sector, level, location_name, lat, lng,
-                            radius_value, is_archived, in_my_searches
+                            radius_value, is_archived, in_my_searches,
+                            where_mode, state_code
                      FROM pv_searches WHERE id = %s AND user_id = %s""",
                   (search_id, user_id))
         search = c.fetchone()
@@ -966,6 +967,8 @@ async def get_search_jobs(search_id: int, user_id: int = Depends(get_current_use
         s_lat = float(search[6]) if search[6] is not None else None
         s_lng = float(search[7]) if search[7] is not None else None
         s_radius = search[8]
+        s_where_mode = search[11] or "address"
+        s_state_code = search[12]
 
         # Filter-match query. Each filter is "NULL = any"; location branches on
         # radius_value. DISTINCT ON collapses identical postings (USAJobs often
@@ -1048,10 +1051,10 @@ async def get_search_jobs(search_id: int, user_id: int = Depends(get_current_use
                 # to drive a single briefcase icon for all matches.
                 job_pins.append((j_lat, j_lng, "minor", "job"))
 
-        # Render the static map only for radius-based searches. Remote-only
-        # searches have no geographic anchor.
+        # Render the static map only for address-mode searches. State and
+        # anywhere modes have no center+radius geographic anchor.
         static_map_url = None
-        if s_radius != "remote" and s_lat is not None and s_lng is not None:
+        if s_where_mode == "address" and s_lat is not None and s_lng is not None:
             try:
                 radius_mi = int(s_radius)
             except Exception:
@@ -1069,6 +1072,8 @@ async def get_search_jobs(search_id: int, user_id: int = Depends(get_current_use
                 "lat": s_lat,
                 "lng": s_lng,
                 "radius_value": s_radius,
+                "where_mode": s_where_mode,
+                "state_code": s_state_code,
                 "is_archived": bool(search[9]),
                 "in_my_searches": bool(search[10]),
             },
