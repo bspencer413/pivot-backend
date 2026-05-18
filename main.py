@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.11"
+VERSION = "0.1.12"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -490,6 +490,18 @@ async def admin_inspect(sector: Optional[str] = None, source: Optional[str] = No
             params.append(source)
         where_clause = (" WHERE " + " AND ".join(where_sql)) if where_sql else ""
 
+        # State breakdown for whatever filter the caller applied. Tells us
+        # at-a-glance where the matching jobs are geographically, which
+        # answers "does coverage exist for the geo this user is searching?".
+        c.execute(
+            "SELECT COALESCE(state, '(null)') AS s, COUNT(*) "
+            "FROM pv_jobs" + where_clause + " "
+            "GROUP BY COALESCE(state, '(null)') "
+            "ORDER BY COUNT(*) DESC",
+            params
+        )
+        breakdown_by_state = [{"state": r[0], "count": r[1]} for r in c.fetchall()]
+
         c.execute(
             "SELECT id, source, company, title, sector, level, location_name, "
             "lat, lng, state, is_remote, posted_at, fetched_at "
@@ -518,6 +530,7 @@ async def admin_inspect(sector: Optional[str] = None, source: Optional[str] = No
         return {
             "filter_applied": {"sector": sector, "source": source, "limit": limit},
             "breakdown_by_source_sector": breakdown,
+            "breakdown_by_state": breakdown_by_state,
             "rows_with_valid_geom_by_source": geom_by_source,
             "freshness": freshness,
             "sample_count": len(samples),
@@ -1428,6 +1441,9 @@ US_STATE_NAME_TO_CODE = {
     "american samoa": "AS", "northern mariana islands": "MP",
 }
 _US_STATE_CODES = set(US_STATE_NAME_TO_CODE.values())
+# Reverse map: 2-letter code → proper-case state name. Used to convert
+# state-mode searches into natural-language strings for Adzuna's where= param.
+US_STATE_CODE_TO_NAME = {v: k.title() for k, v in US_STATE_NAME_TO_CODE.items()}
 
 
 def _extract_state_code(text) -> Optional[str]:
@@ -1555,6 +1571,68 @@ def _normalize_adzuna_item(item: dict) -> Optional[dict]:
         "posted_at": posted_at,
         "raw": item,
     }
+
+
+def _clean_location_for_adzuna(loc_name: str) -> Optional[str]:
+    """Strip ", USA"/", United States" tail from a Google-geocoded location_name
+    so Adzuna's where= parameter sees just the city/region."""
+    if not loc_name:
+        return None
+    s = re.sub(r",\s*(USA|United States|United States of America)\s*$",
+               "", loc_name, flags=re.IGNORECASE).strip()
+    return s if s else None
+
+
+def _get_adzuna_target_locations(max_locations: int = 3) -> List[str]:
+    """Return distinct location strings (city or state) drawn from active
+    pv_searches, ranked by how many users care about them. Used to bias
+    Adzuna's where= queries toward where the user base is actually looking,
+    instead of relying only on the global sort_by=date feed."""
+    locations = []
+    seen = set()
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            # Address-mode: use location_name (cleaned).
+            c.execute("""
+                SELECT location_name, COUNT(*) AS n
+                FROM pv_searches
+                WHERE where_mode = 'address'
+                  AND location_name IS NOT NULL
+                  AND TRIM(location_name) <> ''
+                  AND alert_level <> 'off'
+                GROUP BY location_name
+                ORDER BY n DESC
+            """)
+            for row in c.fetchall():
+                cleaned = _clean_location_for_adzuna(row[0])
+                if cleaned and cleaned.lower() not in seen:
+                    locations.append(cleaned)
+                    seen.add(cleaned.lower())
+                    if len(locations) >= max_locations:
+                        break
+
+            # State-mode: use proper-case state name.
+            if len(locations) < max_locations:
+                c.execute("""
+                    SELECT state_code, COUNT(*) AS n
+                    FROM pv_searches
+                    WHERE where_mode = 'state'
+                      AND state_code IS NOT NULL
+                      AND alert_level <> 'off'
+                    GROUP BY state_code
+                    ORDER BY n DESC
+                """)
+                for row in c.fetchall():
+                    name = US_STATE_CODE_TO_NAME.get(row[0])
+                    if name and name.lower() not in seen:
+                        locations.append(name)
+                        seen.add(name.lower())
+                        if len(locations) >= max_locations:
+                            break
+    except Exception as e:
+        print("[adzuna] target location query failed: " + str(e))
+    return locations
 
 
 # ── Greenhouse normalization helpers ──────────────────────────────────────────
@@ -1861,12 +1939,11 @@ class Sources:
         return out
 
     # ── Adzuna (US private-board aggregator, free with key) ───────────────────
-    # Stub for v0.1.0. v0.1.5+ pulls from
-    # https://api.adzuna.com/v1/api/jobs/us/search/{page} with:
-    #   ADZUNA_APP_ID
-    #   ADZUNA_APP_KEY
-    # Free tier limit is roughly 1000 calls/month. We do max 10 pages × 50
-    # results = up to 500 jobs per tick. At 2 ticks/day = 20 calls/day = ~600/mo.
+    # v0.1.12+: two-phase fetch. Phase 1 pulls global sort_by=date for
+    # nationwide newest jobs. Phase 2 pulls location-targeted queries (where=)
+    # for the cities/states users are watching, fixing the global-feed bias
+    # toward whichever metro is posting most that day. Budget: 6 + 3×3 = 15
+    # calls/tick × 2 ticks/day = 30/day, well under the 33/day free-tier limit.
     @staticmethod
     def fetch_adzuna() -> List[dict]:
         app_id = (os.environ.get("ADZUNA_APP_ID") or "").strip()
@@ -1876,15 +1953,17 @@ class Sources:
             return []
 
         out = []
-        max_pages = 10
         results_per_page = 50
 
-        for page in range(1, max_pages + 1):
+        def _adzuna_page(page: int, where: Optional[str] = None) -> List[dict]:
+            """One paginated fetch. Returns normalized job dicts (may be empty)."""
             url = ("https://api.adzuna.com/v1/api/jobs/us/search/" + str(page)
                    + "?app_id=" + urllib.parse.quote(app_id)
                    + "&app_key=" + urllib.parse.quote(app_key)
                    + "&results_per_page=" + str(results_per_page)
                    + "&sort_by=date")
+            if where:
+                url += "&where=" + urllib.parse.quote(where)
             try:
                 req = urllib.request.Request(url, headers={
                     "User-Agent": Sources.BROWSER_UA,
@@ -1893,25 +1972,52 @@ class Sources:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     data = json_lib.loads(resp.read().decode("utf-8", errors="replace"))
             except Exception as e:
-                print("[adzuna] page " + str(page) + " fetch failed: " + str(e))
-                break
-
+                tag = "where=" + where if where else "global"
+                print("[adzuna] " + tag + " page " + str(page) + " fetch failed: " + str(e))
+                return []
             results = data.get("results") or []
-            if not results:
-                break
-
+            page_out = []
             for item in results:
                 try:
                     normalized = _normalize_adzuna_item(item)
                     if normalized:
-                        out.append(normalized)
+                        page_out.append(normalized)
                 except Exception as e:
                     print("[adzuna] normalize failed: " + str(e))
+            return page_out
 
-            if len(results) < results_per_page:
+        # Phase 1: nationwide newest (6 pages, ~300 jobs).
+        global_count = 0
+        for page in range(1, 7):
+            page_out = _adzuna_page(page, where=None)
+            if not page_out:
                 break
+            out.extend(page_out)
+            global_count += len(page_out)
+            if len(page_out) < results_per_page:
+                break
+        print("[adzuna] global phase: " + str(global_count) + " jobs across "
+              + str(min(6, page)) + " pages")
 
-        print("[adzuna] fetched " + str(len(out)) + " jobs")
+        # Phase 2: location-targeted (3 pages × up to 3 user-watched locations).
+        targets = _get_adzuna_target_locations(max_locations=3)
+        if targets:
+            print("[adzuna] location phase targets: " + ", ".join(targets))
+            for loc in targets:
+                loc_count = 0
+                for page in range(1, 4):
+                    page_out = _adzuna_page(page, where=loc)
+                    if not page_out:
+                        break
+                    out.extend(page_out)
+                    loc_count += len(page_out)
+                    if len(page_out) < results_per_page:
+                        break
+                print("[adzuna] where='" + loc + "': " + str(loc_count) + " jobs")
+        else:
+            print("[adzuna] no location targets; skipping phase 2")
+
+        print("[adzuna] fetched " + str(len(out)) + " jobs (pre-dedupe)")
         return out
 
     # ── Greenhouse (per-employer ATS feeds) ───────────────────────────────────
