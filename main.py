@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.21"
+VERSION = "0.1.22"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -230,6 +230,27 @@ def init_db():
     c.execute("CREATE INDEX IF NOT EXISTS idx_pv_matches_search ON pv_job_matches (search_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_pv_matches_job ON pv_job_matches (job_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_pv_matches_alerted ON pv_job_matches (alerted_at)")
+
+    # pv_signups: pivot-specific signup tracking. The `users` table is shared
+    # across all apps on the same Postgres (Earth Watch, H2O Watch, etc. all
+    # write there), so COUNT(*) FROM users returns the cross-app total -- not
+    # useful for measuring pivot.watch adoption specifically. pv_signups
+    # captures only users who registered or logged in through pivot.
+    c.execute("""CREATE TABLE IF NOT EXISTS pv_signups (
+        user_id INTEGER PRIMARY KEY,
+        first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pv_signups_seen ON pv_signups (first_seen_at)")
+
+    # Backfill: any user who has at least one pv_searches row clearly used
+    # pivot.watch. Backfill them with their earliest search time as their
+    # pivot signup timestamp. Idempotent thanks to ON CONFLICT DO NOTHING.
+    c.execute("""
+        INSERT INTO pv_signups (user_id, first_seen_at)
+        SELECT user_id, MIN(created_at) FROM pv_searches GROUP BY user_id
+        ON CONFLICT (user_id) DO NOTHING
+    """)
 
     conn.commit()
     conn.close()
@@ -606,6 +627,12 @@ async def register(user: UserCreate):
             "INSERT INTO users (email, password_hash) VALUES (%s, %s) RETURNING id",
             (user.email, password_hash))
         user_id = c.fetchone()[0]
+        # Record this user as a pivot.watch signup. The users table is shared
+        # across apps on this Postgres, so the pv_signups row is how the
+        # scoreboard distinguishes pivot users from Earth/H2O/etc.
+        c.execute(
+            "INSERT INTO pv_signups (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+            (user_id,))
         conn.commit()
         access_token = create_access_token(data={"sub": str(user_id)})
         return {"access_token": access_token, "token_type": "bearer"}
@@ -619,6 +646,14 @@ async def login(user: UserLogin):
         result = c.fetchone()
         if not result or not verify_password(user.password, result[1]):
             raise HTTPException(status_code=401, detail="Invalid credentials")
+        # If this user registered elsewhere (Earth/H2O on the shared DB) and
+        # is now logging into pivot for the first time, record them as a
+        # pivot user. ON CONFLICT keeps the original signup timestamp if
+        # they've been here before.
+        c.execute(
+            "INSERT INTO pv_signups (user_id) VALUES (%s) ON CONFLICT (user_id) DO NOTHING",
+            (result[0],))
+        conn.commit()
         access_token = create_access_token(data={"sub": str(result[0])})
         return {"access_token": access_token, "token_type": "bearer"}
 
@@ -2664,22 +2699,27 @@ def run_scheduler():
 
 @app.get("/admin/signup-stats")
 async def admin_signup_stats(x_admin_token: str = Header(None, alias="X-Admin-Token")):
-    """Read-only signup metrics for the 3Brains scoreboard.
-    Requires X-Admin-Token header matching ADMIN_STATS_TOKEN env var."""
+    """Pivot-watch-specific signup metrics for the 3Brains scoreboard.
+    Requires X-Admin-Token header matching ADMIN_STATS_TOKEN env var.
+
+    Counts from pv_signups (not the shared users table) so the dashboard
+    reflects pivot.watch users only -- not the cross-app total of every
+    app sharing this Postgres. pv_signups is populated by /auth/register
+    and /auth/login, and backfilled at startup from pv_searches authors."""
     expected = os.environ.get("ADMIN_STATS_TOKEN")
     if not expected or x_admin_token != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
     with get_db() as conn:
         c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM users")
+        c.execute("SELECT COUNT(*) FROM pv_signups")
         total_users = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '24 hours'")
+        c.execute("SELECT COUNT(*) FROM pv_signups WHERE first_seen_at >= NOW() - INTERVAL '24 hours'")
         signups_24h = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '7 days'")
+        c.execute("SELECT COUNT(*) FROM pv_signups WHERE first_seen_at >= NOW() - INTERVAL '7 days'")
         signups_7d = c.fetchone()[0]
-        c.execute("SELECT COUNT(*) FROM users WHERE created_at >= NOW() - INTERVAL '30 days'")
+        c.execute("SELECT COUNT(*) FROM pv_signups WHERE first_seen_at >= NOW() - INTERVAL '30 days'")
         signups_30d = c.fetchone()[0]
-        c.execute("SELECT MAX(created_at) FROM users")
+        c.execute("SELECT MAX(first_seen_at) FROM pv_signups")
         latest_row = c.fetchone()
         latest = latest_row[0].isoformat() if latest_row and latest_row[0] else None
         return {
