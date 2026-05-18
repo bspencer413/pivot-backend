@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.13"
+VERSION = "0.1.14"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -610,6 +610,130 @@ async def delete_account(user_id: int = Depends(get_current_user)):
 
 
 # ── pivot.watch Searches endpoints ────────────────────────────────────────────
+
+
+# Curated direct-apply directory (v0.1.14+). Closes the data coverage gap for
+# big retail / QSR / service employers who don't post to USAJobs, Adzuna, or
+# Greenhouse but whose careers pages are well-known. Matching is by lower-case
+# substring against `keywords`; first hit wins. Domain field powers the
+# favicon URL (Google's free /s2/favicons service). When a company isn't here,
+# the endpoint falls back to a constructed Google search URL.
+CAREERS_DIRECTORY = {
+    "walmart":         {"name": "Walmart",              "url": "https://careers.walmart.com",                   "domain": "walmart.com",            "keywords": ["walmart"]},
+    "amazon":          {"name": "Amazon",               "url": "https://www.amazon.jobs",                       "domain": "amazon.com",             "keywords": ["amazon"]},
+    "mcdonalds":       {"name": "McDonald's",           "url": "https://careers.mcdonalds.com",                 "domain": "mcdonalds.com",          "keywords": ["mcdonald", "mcdonalds", "mcdonald's"]},
+    "homedepot":       {"name": "The Home Depot",       "url": "https://careers.homedepot.com",                 "domain": "homedepot.com",          "keywords": ["home depot", "homedepot"]},
+    "kroger":          {"name": "Kroger",               "url": "https://jobs.kroger.com",                       "domain": "kroger.com",             "keywords": ["kroger"]},
+    "target":          {"name": "Target",               "url": "https://corporate.target.com/careers",          "domain": "target.com",             "keywords": ["target"]},
+    "costco":          {"name": "Costco",               "url": "https://www.costco.com/job-opportunities.html", "domain": "costco.com",             "keywords": ["costco"]},
+    "starbucks":       {"name": "Starbucks",            "url": "https://www.starbucks.com/careers",             "domain": "starbucks.com",          "keywords": ["starbucks"]},
+    "fedex":           {"name": "FedEx",                "url": "https://careers.fedex.com",                     "domain": "fedex.com",              "keywords": ["fedex"]},
+    "ups":             {"name": "UPS",                  "url": "https://www.jobs-ups.com",                      "domain": "ups.com",                "keywords": ["ups", "united parcel"]},
+    "lowes":           {"name": "Lowe's",               "url": "https://talent.lowes.com",                      "domain": "lowes.com",              "keywords": ["lowe's", "lowes"]},
+    "bestbuy":         {"name": "Best Buy",             "url": "https://jobs.bestbuy.com",                      "domain": "bestbuy.com",            "keywords": ["best buy", "bestbuy"]},
+    "ross":            {"name": "Ross Stores",          "url": "https://jobs.rossstores.com",                   "domain": "rossstores.com",         "keywords": ["ross stores", "ross dress"]},
+    "tjx":             {"name": "TJX (TJ Maxx)",        "url": "https://www.jobs.tjx.com",                      "domain": "tjx.com",                "keywords": ["tj maxx", "tjmaxx", "tjx", "marshalls", "homegoods", "sierra"]},
+    "albertsons":      {"name": "Albertsons",           "url": "https://www.albertsonscompanies.com/careers",   "domain": "albertsons.com",         "keywords": ["albertsons", "safeway"]},
+    "publix":          {"name": "Publix",               "url": "https://corporate.publix.com/careers",          "domain": "publix.com",             "keywords": ["publix"]},
+    "cvs":             {"name": "CVS Health",           "url": "https://jobs.cvshealth.com",                    "domain": "cvs.com",                "keywords": ["cvs"]},
+    "walgreens":       {"name": "Walgreens",            "url": "https://jobs.walgreens.com",                    "domain": "walgreens.com",          "keywords": ["walgreens"]},
+    "dollargeneral":   {"name": "Dollar General",       "url": "https://careers.dollargeneral.com",             "domain": "dollargeneral.com",      "keywords": ["dollar general", "dollargeneral"]},
+    "dollartree":      {"name": "Dollar Tree",          "url": "https://www.dollartreeinfo.com/careers",        "domain": "dollartree.com",         "keywords": ["dollar tree", "dollartree", "family dollar"]},
+    "wholefoods":      {"name": "Whole Foods Market",   "url": "https://www.wholefoodsmarket.com/careers",      "domain": "wholefoodsmarket.com",   "keywords": ["whole foods", "wholefoods"]},
+    "traderjoes":      {"name": "Trader Joe's",         "url": "https://www.traderjoes.com/careers",            "domain": "traderjoes.com",         "keywords": ["trader joe", "traderjoes"]},
+    "chipotle":        {"name": "Chipotle",             "url": "https://jobs.chipotle.com",                     "domain": "chipotle.com",           "keywords": ["chipotle"]},
+    "subway":          {"name": "Subway",               "url": "https://www.subway.com/en-us/aboutus/careers",  "domain": "subway.com",             "keywords": ["subway"]},
+    "burgerking":      {"name": "Burger King",          "url": "https://careers.bk.com",                        "domain": "bk.com",                 "keywords": ["burger king", "burgerking"]},
+    "wendys":          {"name": "Wendy's",              "url": "https://www.wendys.com/careers",                "domain": "wendys.com",             "keywords": ["wendy", "wendys", "wendy's"]},
+    "tacobell":        {"name": "Taco Bell",            "url": "https://www.tacobell.com/careers",              "domain": "tacobell.com",           "keywords": ["taco bell", "tacobell"]},
+    "kfc":             {"name": "KFC",                  "url": "https://jobs.kfc.com",                          "domain": "kfc.com",                "keywords": ["kfc", "kentucky fried"]},
+    "dominos":         {"name": "Domino's",             "url": "https://jobs.dominos.com",                      "domain": "dominos.com",            "keywords": ["domino", "dominos", "domino's"]},
+    "pizzahut":        {"name": "Pizza Hut",            "url": "https://jobs.pizzahut.com",                     "domain": "pizzahut.com",           "keywords": ["pizza hut", "pizzahut"]},
+    "chickfila":       {"name": "Chick-fil-A",          "url": "https://www.chick-fil-a.com/careers",           "domain": "chick-fil-a.com",        "keywords": ["chick-fil-a", "chickfila", "chick fil a"]},
+    "darden":          {"name": "Darden (Olive Garden)","url": "https://careers.darden.com",                    "domain": "darden.com",             "keywords": ["darden", "olive garden", "longhorn", "yard house", "capital grille"]},
+    "marriott":        {"name": "Marriott",             "url": "https://careers.marriott.com",                  "domain": "marriott.com",           "keywords": ["marriott"]},
+    "hilton":          {"name": "Hilton",               "url": "https://jobs.hilton.com",                       "domain": "hilton.com",             "keywords": ["hilton"]},
+    "hyatt":           {"name": "Hyatt",                "url": "https://careers.hyatt.com",                     "domain": "hyatt.com",              "keywords": ["hyatt"]},
+    "disney":          {"name": "Disney",               "url": "https://jobs.disneycareers.com",                "domain": "disney.com",             "keywords": ["disney", "walt disney"]},
+    "att":             {"name": "AT&T",                 "url": "https://www.att.jobs",                          "domain": "att.com",                "keywords": ["at&t", "att inc"]},
+    "verizon":         {"name": "Verizon",              "url": "https://mycareer.verizon.com",                  "domain": "verizon.com",            "keywords": ["verizon"]},
+    "tmobile":         {"name": "T-Mobile",             "url": "https://careers.t-mobile.com",                  "domain": "t-mobile.com",           "keywords": ["t-mobile", "tmobile"]},
+    "macys":           {"name": "Macy's",               "url": "https://www.macysjobs.com",                     "domain": "macys.com",              "keywords": ["macy", "macys", "macy's"]},
+    "nordstrom":       {"name": "Nordstrom",            "url": "https://careers.nordstrom.com",                 "domain": "nordstrom.com",          "keywords": ["nordstrom"]},
+    "gap":             {"name": "Gap Inc.",             "url": "https://jobs.gapinc.com",                       "domain": "gap.com",                "keywords": ["gap inc", "old navy", "banana republic", "athleta"]},
+    "bathandbody":     {"name": "Bath & Body Works",    "url": "https://careers.bbwinc.com",                    "domain": "bathandbodyworks.com",   "keywords": ["bath & body", "bath and body", "bbw"]},
+    "sephora":         {"name": "Sephora",              "url": "https://www.sephora.jobs",                      "domain": "sephora.com",            "keywords": ["sephora"]},
+    "ulta":            {"name": "Ulta Beauty",          "url": "https://careers.ulta.com",                      "domain": "ulta.com",               "keywords": ["ulta"]},
+    "dicks":           {"name": "Dick's Sporting Goods","url": "https://careers.dicks.com",                     "domain": "dickssportinggoods.com", "keywords": ["dick's sporting", "dicks sporting"]},
+    "petco":           {"name": "Petco",                "url": "https://careers.petco.com",                     "domain": "petco.com",              "keywords": ["petco"]},
+    "petsmart":        {"name": "PetSmart",             "url": "https://careers.petsmart.com",                  "domain": "petsmart.com",           "keywords": ["petsmart"]},
+    "samsclub":        {"name": "Sam's Club",           "url": "https://careers.samsclub.com",                  "domain": "samsclub.com",           "keywords": ["sam's club", "sams club"]},
+    "aldi":            {"name": "Aldi",                 "url": "https://careers.aldi.us",                       "domain": "aldi.us",                "keywords": ["aldi"]},
+    "trader_costco_combined_filler_50":  # placeholder filler removed below
+                       {"name": "_filler",              "url": "",                                              "domain": "",                       "keywords": []},
+}
+# Trim placeholder so the dict has exactly 50 real entries.
+CAREERS_DIRECTORY.pop("trader_costco_combined_filler_50", None)
+
+
+def _careers_directory_lookup(company: str) -> Optional[dict]:
+    """Fuzzy-match a user-typed company string against CAREERS_DIRECTORY.
+    Strips common legal suffixes first, then tries (a) exact key match,
+    (b) keyword substring match. Returns the directory entry dict or None."""
+    if not company:
+        return None
+    s = company.lower().strip()
+    s = re.sub(r"\s+(inc\.?|corp\.?|llc|ltd\.?|llp|holdings?|group|co\.?|company)$",
+               "", s).strip()
+    if not s:
+        return None
+    # Exact key match
+    key = re.sub(r"[^a-z0-9]", "", s)  # normalize key form
+    if key in CAREERS_DIRECTORY:
+        return dict(CAREERS_DIRECTORY[key], _key=key)
+    # Keyword substring match
+    for k, entry in CAREERS_DIRECTORY.items():
+        for kw in entry.get("keywords", []):
+            if kw and kw in s:
+                return dict(entry, _key=k)
+    return None
+
+
+@app.get("/pv/careers")
+async def get_careers_link(company: str):
+    """Return a direct careers URL + logo for the given company. Uses the
+    curated CAREERS_DIRECTORY first; falls back to a Google search URL when
+    the company isn't in the directory. logo_url uses Google's free favicon
+    service so it always renders without API keys."""
+    company = (company or "").strip()
+    if not company:
+        raise HTTPException(status_code=400, detail="company query param required")
+
+    entry = _careers_directory_lookup(company)
+    if entry:
+        return {
+            "found": True,
+            "name": entry["name"],
+            "url": entry["url"],
+            "domain": entry["domain"],
+            "logo_url": ("https://www.google.com/s2/favicons?domain="
+                         + entry["domain"] + "&sz=128"),
+            "source": "directory",
+        }
+
+    # Fallback: Google search URL with "careers" suffix. Always shows the user
+    # something useful even for employers we haven't curated.
+    google_url = ("https://www.google.com/search?q="
+                  + urllib.parse.quote(company.strip() + " careers"))
+    return {
+        "found": False,
+        "name": company.title(),
+        "url": google_url,
+        "domain": None,
+        "logo_url": None,
+        "source": "google_fallback",
+    }
+
 
 @app.get("/pv/searches", response_model=List[SearchResponse])
 async def list_searches(user_id: int = Depends(get_current_user)):
