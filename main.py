@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -926,8 +926,11 @@ async def delete_notification(notif_id: int, user_id: int = Depends(get_current_
 # plus the OPM occupational-series → sector and GS-grade → level mappings.
 
 def _usajobs_sector_for_series(code) -> str:
-    """OPM occupational series → one of our 12 sector slugs. All USAJobs
-    postings are federal, so 'government' is the catch-all default."""
+    """OPM occupational series → one of our 21 sector slugs. USAJobs is all
+    federal, so most uncategorized series default to 'government'. Recognized
+    series are routed to the more specific sector that matches private-board
+    categorization (so a federal accountant and a private accountant land in
+    the same 'finance' bucket)."""
     if not code:
         return "government"
     c = str(code).zfill(4)
@@ -937,19 +940,20 @@ def _usajobs_sector_for_series(code) -> str:
     # 0810 (Civil Engineering) + 0828 (Construction Analyst) → construction
     if c in ("0810", "0828"):
         return "construction"
-    # 08XX = Engineering family
+    # 08XX rest = Engineering family
     if c.startswith("08"):
         return "engineering"
     # Legal: 0901 (General Legal), 0904 (Law Clerk), 0905 (General Attorney)
     if c in ("0901", "0904", "0905"):
         return "legal"
     # Healthcare: Medical Officer, Nurse, Pharmacist, Dental, Health Tech families
-    if c in ("0602", "0610", "0660", "0680", "0640", "0644", "0671", "0699"):
+    if c in ("0602", "0610", "0660", "0680", "0640", "0644", "0671", "0699",
+             "0601", "0603", "0620", "0633", "0645", "0647", "0648", "0649"):
         return "healthcare"
     # 05XX = Accounting and Budget family
     if c.startswith("05"):
         return "finance"
-    # 17XX = Education family
+    # 17XX = Education family (teachers, education specialists)
     if c.startswith("17"):
         return "education"
     # 02XX = Human Resources family
@@ -958,9 +962,42 @@ def _usajobs_sector_for_series(code) -> str:
     # 1083 = Public Affairs (closest federal match for Marketing/PR)
     if c == "1083":
         return "marketing"
-    # 1170 = Realty (closest federal match for Sales)
+    # 1170 = Realty
     if c == "1170":
+        return "real_estate"
+    # 03XX = Administration family (Misc Admin, Clerical, Mgmt Analyst etc.)
+    if c.startswith("03"):
+        return "administration"
+    # Science & Research: 13XX physical sciences, 04XX biological sciences,
+    # 14XX library/info science, 1500 mathematics
+    if c.startswith("13") or c.startswith("04") or c.startswith("14") or c == "1500":
+        return "science"
+    # Social Services: 0185 (Social Work), 0186 (Social Services Aide),
+    # 0187 (Social Services), 0188 (Recreation Specialist), 0189 (Recreation Aid)
+    if c.startswith("018"):
+        return "social_services"
+    # Transport & Logistics: 20XX (Supply), 21XX (Transportation)
+    if c.startswith("21") or c.startswith("20"):
+        return "transport"
+    # Customer Service: 0962 (Contact Representative)
+    if c == "0962":
+        return "customer_service"
+    # Creative & Design: 1001 (General Arts/Info), 1015 (Museum Curator),
+    # 1020 (Illustrator), 1060 (Photography), 1071 (Audiovisual Production)
+    if c in ("1001", "1015", "1020", "1060", "1071", "1082", "1084"):
+        return "creative"
+    # Sales/marketing-adjacent: 1101 (General Business), 1102 (Contracting)
+    if c in ("1102", "1101"):
         return "sales"
+    # Manufacturing/trades: 1601 (Equipment Facilities Services), 4XXX (Wage Grade trades)
+    if c.startswith("4") or c == "1601":
+        return "manufacturing"
+    # Hospitality: 1667 (Steward), 7404 (Cooking) — rare in federal
+    if c in ("1667", "7404"):
+        return "hospitality"
+    # Retail: 1144 (Commissary Mgmt), 2091 (Sales Store Clerical) — rare in federal
+    if c in ("1144", "2091"):
+        return "retail"
     return "government"
 
 
@@ -1201,7 +1238,12 @@ class Sources:
 
 def upsert_jobs(conn, normalized: List[dict]) -> List[int]:
     """Upsert normalized jobs into pv_jobs. Returns the ids of rows that were
-    NEWLY inserted (so we only filter-match the new ones)."""
+    NEWLY inserted (so we only filter-match the new ones, never re-alert on
+    existing rows). On conflict, existing rows are UPDATED -- this lets
+    sector/level mapping changes (e.g. expanding the OPM-series → sector map)
+    propagate to all existing jobs on the next cron tick, instead of leaving
+    them stuck at whatever bucket they were originally categorized into.
+    The xmax=0 trick distinguishes a true INSERT from a DO UPDATE re-write."""
     if not normalized:
         return []
     new_ids = []
@@ -1227,8 +1269,25 @@ def upsert_jobs(conn, normalized: List[dict]) -> List[int]:
                          THEN ST_SetSRID(ST_GeomFromText(%s), 4326)::geography
                          ELSE NULL END
                 )
-                ON CONFLICT (source, external_id) DO NOTHING
-                RETURNING id
+                ON CONFLICT (source, external_id) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    company = EXCLUDED.company,
+                    sector = EXCLUDED.sector,
+                    level = EXCLUDED.level,
+                    location_name = EXCLUDED.location_name,
+                    lat = EXCLUDED.lat,
+                    lng = EXCLUDED.lng,
+                    is_remote = EXCLUDED.is_remote,
+                    salary_min = EXCLUDED.salary_min,
+                    salary_max = EXCLUDED.salary_max,
+                    salary_currency = EXCLUDED.salary_currency,
+                    description = EXCLUDED.description,
+                    url = EXCLUDED.url,
+                    posted_at = EXCLUDED.posted_at,
+                    fetched_at = CURRENT_TIMESTAMP,
+                    raw_payload = EXCLUDED.raw_payload,
+                    geom = EXCLUDED.geom
+                RETURNING id, (xmax = 0) AS inserted
             """, (
                 j["source"], j["external_id"], j.get("title"), j.get("company"),
                 j.get("sector"), j.get("level"),
@@ -1240,7 +1299,10 @@ def upsert_jobs(conn, normalized: List[dict]) -> List[int]:
                 geom_wkt, geom_wkt,
             ))
             row = c.fetchone()
-            if row:
+            # Only treat as "new" if this was a true INSERT (xmax = 0).
+            # DO UPDATE conflicts return the row but with xmax != 0; skip those
+            # so filter_match_and_alert never re-fires on existing jobs.
+            if row and row[1]:
                 new_ids.append(row[0])
         except Exception as e:
             print("[upsert_jobs] " + j.get("source", "?") + ":" + str(j.get("external_id", "?")) + " — " + str(e))
