@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -674,7 +674,7 @@ async def get_search_jobs(search_id: int, user_id: int = Depends(get_current_use
                   (s.radius_value = 'remote' AND j.is_remote = TRUE)
                   OR
                   (s.radius_value != 'remote' AND s.geom IS NOT NULL AND j.geom IS NOT NULL
-                   AND ST_DWithin(j.geom, s.geom, (s.radius_value::int) * 1609.344))
+                   AND ST_DWithin(j.geom, s.geom, NULLIF(s.radius_value, 'remote')::int * 1609.344))
                 )
                 AND j.fetched_at > NOW() - INTERVAL '3 days'
               ORDER BY LOWER(j.title), LOWER(COALESCE(j.company,'')), COALESCE(j.location_name,''), j.posted_at DESC
@@ -1815,7 +1815,7 @@ def filter_match_and_alert(conn, new_job_ids: List[int]) -> int:
               (s.radius_value = 'remote' AND j.is_remote = TRUE)
               OR
               (s.radius_value != 'remote' AND s.geom IS NOT NULL AND j.geom IS NOT NULL
-               AND ST_DWithin(j.geom, s.geom, (s.radius_value::int) * 1609.344))
+               AND ST_DWithin(j.geom, s.geom, NULLIF(s.radius_value, 'remote')::int * 1609.344))
          )
         WHERE j.id = ANY(%s)
         ON CONFLICT (job_id, search_id) DO NOTHING
