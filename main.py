@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -1125,6 +1125,158 @@ def _normalize_usajobs_item(item: dict) -> Optional[dict]:
     }
 
 
+# ── Adzuna normalization helpers ──────────────────────────────────────────────
+# Maps a single Adzuna /search result into the pv_jobs dict shape. Adzuna's
+# 28 category tags map cleanly to most of our 21 sector slugs. Level isn't
+# explicit in Adzuna -- we keyword-scan the title.
+
+def _adzuna_sector_for_tag(tag) -> str:
+    """Adzuna category tag → one of our 21 sector slugs. Unrecognized tags
+    default to 'administration' as a catch-all for general/clerical roles."""
+    if not tag:
+        return "administration"
+    t = str(tag).lower().strip()
+    mapping = {
+        "it-jobs":                       "it",
+        "engineering-jobs":              "engineering",
+        "legal-jobs":                    "legal",
+        "healthcare-nursing-jobs":       "healthcare",
+        "accounting-finance-jobs":       "finance",
+        "sales-jobs":                    "sales",
+        "pr-advertising-marketing-jobs": "marketing",
+        "hr-jobs":                       "hr",
+        "teaching-jobs":                 "education",
+        "trade-construction-jobs":       "construction",
+        "admin-jobs":                    "administration",
+        "creative-design-jobs":          "creative",
+        "customer-services-jobs":        "customer_service",
+        "hospitality-catering-jobs":     "hospitality",
+        "manufacturing-jobs":            "manufacturing",
+        "property-jobs":                 "real_estate",
+        "retail-jobs":                   "retail",
+        "scientific-qa-jobs":            "science",
+        "social-work-jobs":              "social_services",
+        "logistics-warehouse-jobs":      "transport",
+        "travel-jobs":                   "hospitality",
+        "energy-oil-gas-jobs":           "engineering",
+        "charity-voluntary-jobs":        "social_services",
+        "consultancy-jobs":              "administration",
+        "domestic-help-cleaning-jobs":   "customer_service",
+        "graduate-jobs":                 "administration",
+        "part-time-jobs":                "administration",
+        "other-general-jobs":            "administration",
+        "unknown":                       "administration",
+    }
+    return mapping.get(t, "administration")
+
+
+def _level_from_title_keywords(title: str) -> str:
+    """Keyword-based level guesser. Shared between Adzuna and any future
+    private-board sources that lack a structured grade/level field."""
+    if not title:
+        return "mid"
+    t = title.upper()
+    if any(w in t for w in ["INTERN", "TRAINEE", "STUDENT", "JUNIOR",
+                            "ENTRY LEVEL", "ENTRY-LEVEL", "GRADUATE", " JR "]):
+        return "entry"
+    if any(w in t for w in ["DIRECTOR", "VP", "VICE PRESIDENT", "CHIEF ",
+                            "HEAD OF", "EXECUTIVE", "PRESIDENT", " CEO",
+                            " CTO", " CFO", " COO"]):
+        return "executive"
+    if any(w in t for w in ["SENIOR", "PRINCIPAL", "LEAD ", " SR ", " SR.",
+                            "STAFF "]):
+        return "senior"
+    return "mid"
+
+
+def _normalize_adzuna_item(item: dict) -> Optional[dict]:
+    """Map one Adzuna /search result into the pv_jobs dict shape, or None
+    if essential fields are missing."""
+    external_id = item.get("id")
+    if not external_id:
+        return None
+
+    title = (item.get("title") or "").strip()
+
+    # Company: Adzuna sometimes returns "Unknown" for company.display_name.
+    company = ""
+    co = item.get("company") or {}
+    if isinstance(co, dict):
+        company = (co.get("display_name") or "").strip()
+    if company.lower() == "unknown":
+        company = ""
+
+    # Location: display_name + lat/lng.
+    location_name = ""
+    loc = item.get("location") or {}
+    if isinstance(loc, dict):
+        location_name = (loc.get("display_name") or "").strip()
+    lat = item.get("latitude")
+    lng = item.get("longitude")
+    try:
+        lat = float(lat) if lat not in (None, "", 0, "0", 0.0) else None
+        lng = float(lng) if lng not in (None, "", 0, "0", 0.0) else None
+    except Exception:
+        lat = None
+        lng = None
+
+    # Remote detection: Adzuna doesn't have a structured flag. Check title
+    # and location strings for the "remote" keyword.
+    combined = (title + " " + location_name).lower()
+    is_remote = "remote" in combined or "work from home" in combined or "wfh" in combined
+
+    # Salary: salary_min, salary_max as floats. Already in annual USD.
+    salary_min = item.get("salary_min")
+    salary_max = item.get("salary_max")
+    try:
+        salary_min = float(salary_min) if salary_min not in (None, "") else None
+    except Exception:
+        salary_min = None
+    try:
+        salary_max = float(salary_max) if salary_max not in (None, "") else None
+    except Exception:
+        salary_max = None
+
+    # Sector from category tag.
+    cat = item.get("category") or {}
+    tag = cat.get("tag") if isinstance(cat, dict) else None
+    sector = _adzuna_sector_for_tag(tag)
+
+    # Level from title keywords.
+    level = _level_from_title_keywords(title)
+
+    # Posted date — Adzuna gives ISO 8601 in 'created'.
+    posted_at = item.get("created")
+
+    # URL: redirect_url is the Adzuna-tracked link to the actual posting.
+    url = item.get("redirect_url") or ""
+
+    # Description: cap at 2KB.
+    description = (item.get("description") or "")
+    if description and len(description) > 2000:
+        description = description[:2000] + "…"
+
+    return {
+        "source": "adzuna",
+        "external_id": str(external_id),
+        "title": title,
+        "company": company,
+        "sector": sector,
+        "level": level,
+        "location_name": location_name,
+        "lat": lat,
+        "lng": lng,
+        "is_remote": is_remote,
+        "salary_min": salary_min,
+        "salary_max": salary_max,
+        "salary_currency": "USD",
+        "description": description,
+        "url": url,
+        "posted_at": posted_at,
+        "raw": item,
+    }
+
+
 class Sources:
     """All job feed adapters. Each fetch_* returns a list of normalized job dicts."""
 
@@ -1202,13 +1354,58 @@ class Sources:
         return out
 
     # ── Adzuna (US private-board aggregator, free with key) ───────────────────
-    # Stub for v0.1.0. v0.1.2 will pull from
-    # https://api.adzuna.com/v1/api/jobs/us/search/1 with:
+    # Stub for v0.1.0. v0.1.5+ pulls from
+    # https://api.adzuna.com/v1/api/jobs/us/search/{page} with:
     #   ADZUNA_APP_ID
     #   ADZUNA_APP_KEY
+    # Free tier limit is roughly 1000 calls/month. We do max 10 pages × 50
+    # results = up to 500 jobs per tick. At 2 ticks/day = 20 calls/day = ~600/mo.
     @staticmethod
     def fetch_adzuna() -> List[dict]:
-        return []
+        app_id = (os.environ.get("ADZUNA_APP_ID") or "").strip()
+        app_key = (os.environ.get("ADZUNA_APP_KEY") or "").strip()
+        if not app_id or not app_key:
+            print("[adzuna] ADZUNA_APP_ID or ADZUNA_APP_KEY not set; skipping")
+            return []
+
+        out = []
+        max_pages = 10
+        results_per_page = 50
+
+        for page in range(1, max_pages + 1):
+            url = ("https://api.adzuna.com/v1/api/jobs/us/search/" + str(page)
+                   + "?app_id=" + urllib.parse.quote(app_id)
+                   + "&app_key=" + urllib.parse.quote(app_key)
+                   + "&results_per_page=" + str(results_per_page)
+                   + "&sort_by=date")
+            try:
+                req = urllib.request.Request(url, headers={
+                    "User-Agent": Sources.BROWSER_UA,
+                    "Accept": "application/json",
+                })
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    data = json_lib.loads(resp.read().decode("utf-8", errors="replace"))
+            except Exception as e:
+                print("[adzuna] page " + str(page) + " fetch failed: " + str(e))
+                break
+
+            results = data.get("results") or []
+            if not results:
+                break
+
+            for item in results:
+                try:
+                    normalized = _normalize_adzuna_item(item)
+                    if normalized:
+                        out.append(normalized)
+                except Exception as e:
+                    print("[adzuna] normalize failed: " + str(e))
+
+            if len(results) < results_per_page:
+                break
+
+        print("[adzuna] fetched " + str(len(out)) + " jobs")
+        return out
 
     # ── Greenhouse (per-employer ATS feeds) ───────────────────────────────────
     # Stub for v0.1.0. v0.1.3 will pull from
