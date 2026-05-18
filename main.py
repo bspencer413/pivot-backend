@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.20"
+VERSION = "0.1.21"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -701,6 +701,171 @@ CAREERS_DIRECTORY = {
 CAREERS_DIRECTORY.pop("trader_costco_combined_filler_50", None)
 
 
+# Phase 1B (v0.1.21+): sector tags for every directory entry. Stored in a
+# sidecar dict so we don't have to rewrite the entire CAREERS_DIRECTORY block.
+# Each value is a list of sector slugs from the canonical 21-sector taxonomy.
+# Multi-tag where applicable -- e.g., Amazon spans retail + IT + logistics,
+# CVS spans retail + healthcare, McDonald's spans hospitality + retail.
+_DIRECTORY_SECTORS = {
+    # ── Big-box & general retail ────────────────────────────────────────
+    "walmart":       ["retail"],
+    "target":        ["retail"],
+    "costco":        ["retail"],
+    "samsclub":      ["retail"],
+    "kroger":        ["retail"],
+    "albertsons":    ["retail"],
+    "publix":        ["retail"],
+    "traderjoes":    ["retail"],
+    "wholefoods":    ["retail"],
+    "aldi":          ["retail"],
+    "ross":          ["retail"],
+    "tjx":           ["retail"],
+    "macys":         ["retail"],
+    "nordstrom":     ["retail"],
+    "gap":           ["retail"],
+    "bathandbody":   ["retail"],
+    "sephora":       ["retail"],
+    "ulta":          ["retail"],
+    "dicks":         ["retail"],
+    "petco":         ["retail"],
+    "petsmart":      ["retail"],
+    "dollargeneral": ["retail"],
+    "dollartree":    ["retail"],
+    "bestbuy":       ["retail", "it"],
+    "homedepot":     ["retail", "construction"],
+    "lowes":         ["retail", "construction"],
+    "cvs":           ["retail", "healthcare"],
+    "walgreens":     ["retail", "healthcare"],
+
+    # ── QSR / restaurants (hospitality + retail) ─────────────────────────
+    "mcdonalds":     ["hospitality", "retail"],
+    "starbucks":     ["hospitality", "retail"],
+    "subway":        ["hospitality", "retail"],
+    "burgerking":    ["hospitality", "retail"],
+    "wendys":        ["hospitality", "retail"],
+    "tacobell":      ["hospitality", "retail"],
+    "kfc":           ["hospitality", "retail"],
+    "dominos":       ["hospitality", "retail"],
+    "pizzahut":      ["hospitality", "retail"],
+    "chickfila":     ["hospitality", "retail"],
+    "chipotle":      ["hospitality", "retail"],
+    "darden":        ["hospitality"],
+
+    # ── Hotels & resorts ────────────────────────────────────────────────
+    "marriott":      ["hospitality"],
+    "hilton":        ["hospitality"],
+    "hyatt":         ["hospitality"],
+
+    # ── Logistics / transport ───────────────────────────────────────────
+    "fedex":         ["transport"],
+    "ups":           ["transport"],
+
+    # ── Mixed / multi-vertical (e-com, telecom, media) ──────────────────
+    "amazon":        ["retail", "it", "transport"],
+    "att":           ["it", "customer_service", "sales"],
+    "verizon":       ["it", "customer_service", "sales"],
+    "tmobile":       ["it", "customer_service", "sales"],
+    "disney":        ["hospitality", "creative", "marketing"],
+}
+
+
+# Phase 1C (v0.1.21+): sector-balanced expansion -- ~72 additions covering
+# Finance / IT / Healthcare / Manufacturing+Defense / Energy / Media+Telecom.
+# These join the existing 50 to give the Browse page real cross-sector depth.
+CAREERS_DIRECTORY.update({
+    # ── Finance (banks, payment networks, asset managers, brokerages) ───
+    "jpmorgan":      {"name": "JPMorgan Chase",     "url": "https://careers.jpmorgan.com",                            "domain": "jpmorganchase.com",      "keywords": ["jpmorgan", "jp morgan", "chase bank", "chase"],          "sectors": ["finance"]},
+    "bofa":          {"name": "Bank of America",    "url": "https://careers.bankofamerica.com",                       "domain": "bankofamerica.com",      "keywords": ["bank of america", "bofa"],                                "sectors": ["finance"]},
+    "wellsfargo":    {"name": "Wells Fargo",        "url": "https://www.wellsfargojobs.com",                          "domain": "wellsfargo.com",         "keywords": ["wells fargo"],                                            "sectors": ["finance"]},
+    "goldman":       {"name": "Goldman Sachs",      "url": "https://www.goldmansachs.com/careers",                    "domain": "goldmansachs.com",       "keywords": ["goldman sachs", "goldman"],                               "sectors": ["finance"]},
+    "morganstanley": {"name": "Morgan Stanley",     "url": "https://www.morganstanley.com/people-opportunities/careers", "domain": "morganstanley.com",   "keywords": ["morgan stanley"],                                         "sectors": ["finance"]},
+    "citi":          {"name": "Citigroup",          "url": "https://jobs.citi.com",                                   "domain": "citigroup.com",          "keywords": ["citi", "citigroup", "citibank"],                          "sectors": ["finance"]},
+    "capitalone":    {"name": "Capital One",        "url": "https://www.capitalonecareers.com",                       "domain": "capitalone.com",         "keywords": ["capital one"],                                            "sectors": ["finance"]},
+    "amex":          {"name": "American Express",   "url": "https://jobs.americanexpress.com",                        "domain": "americanexpress.com",    "keywords": ["american express", "amex"],                               "sectors": ["finance"]},
+    "schwab":        {"name": "Charles Schwab",     "url": "https://jobs.schwab.com",                                 "domain": "schwab.com",             "keywords": ["charles schwab", "schwab"],                               "sectors": ["finance"]},
+    "fidelity":      {"name": "Fidelity Investments","url": "https://jobs.fidelity.com",                              "domain": "fidelity.com",           "keywords": ["fidelity"],                                               "sectors": ["finance"]},
+    "visa":          {"name": "Visa",               "url": "https://corporate.visa.com/en/careers.html",              "domain": "visa.com",               "keywords": ["visa inc", "visa"],                                       "sectors": ["finance"]},
+    "mastercard":    {"name": "Mastercard",         "url": "https://careers.mastercard.com",                          "domain": "mastercard.com",         "keywords": ["mastercard"],                                             "sectors": ["finance"]},
+    "blackrock":     {"name": "BlackRock",          "url": "https://careers.blackrock.com",                           "domain": "blackrock.com",          "keywords": ["blackrock"],                                              "sectors": ["finance"]},
+    "vanguard":      {"name": "Vanguard",           "url": "https://www.vanguardjobs.com",                            "domain": "vanguard.com",           "keywords": ["vanguard"],                                               "sectors": ["finance"]},
+    "statestreet":   {"name": "State Street",       "url": "https://www.statestreet.com/us/en/asset-owner/careers",   "domain": "statestreet.com",        "keywords": ["state street"],                                           "sectors": ["finance"]},
+    "pnc":           {"name": "PNC Bank",           "url": "https://www.pnc.jobs",                                    "domain": "pnc.com",                "keywords": ["pnc"],                                                    "sectors": ["finance"]},
+    "usbank":        {"name": "U.S. Bank",          "url": "https://careers.usbank.com",                              "domain": "usbank.com",             "keywords": ["us bank", "u.s. bank", "usbank"],                         "sectors": ["finance"]},
+    "tdbank":        {"name": "TD Bank",            "url": "https://jobs.td.com",                                     "domain": "td.com",                 "keywords": ["td bank"],                                                "sectors": ["finance"]},
+
+    # ── IT / software / cloud / hardware ────────────────────────────────
+    "microsoft":     {"name": "Microsoft",          "url": "https://careers.microsoft.com",                           "domain": "microsoft.com",          "keywords": ["microsoft"],                                              "sectors": ["it"]},
+    "apple":         {"name": "Apple",              "url": "https://www.apple.com/careers",                           "domain": "apple.com",              "keywords": ["apple inc", "apple"],                                     "sectors": ["it"]},
+    "google":        {"name": "Google / Alphabet",  "url": "https://careers.google.com",                              "domain": "google.com",             "keywords": ["google", "alphabet"],                                     "sectors": ["it"]},
+    "meta":          {"name": "Meta",               "url": "https://www.metacareers.com",                             "domain": "meta.com",               "keywords": ["meta", "facebook", "instagram"],                          "sectors": ["it"]},
+    "oracle":        {"name": "Oracle",             "url": "https://careers.oracle.com",                              "domain": "oracle.com",             "keywords": ["oracle"],                                                 "sectors": ["it"]},
+    "salesforce":    {"name": "Salesforce",         "url": "https://www.salesforce.com/company/careers",              "domain": "salesforce.com",         "keywords": ["salesforce"],                                             "sectors": ["it"]},
+    "ibm":           {"name": "IBM",                "url": "https://www.ibm.com/careers",                             "domain": "ibm.com",                "keywords": ["ibm"],                                                    "sectors": ["it"]},
+    "cisco":         {"name": "Cisco",              "url": "https://jobs.cisco.com",                                  "domain": "cisco.com",              "keywords": ["cisco"],                                                  "sectors": ["it"]},
+    "adobe":         {"name": "Adobe",              "url": "https://careers.adobe.com",                               "domain": "adobe.com",              "keywords": ["adobe"],                                                  "sectors": ["it", "creative"]},
+    "intel":         {"name": "Intel",              "url": "https://jobs.intel.com",                                  "domain": "intel.com",              "keywords": ["intel"],                                                  "sectors": ["it", "manufacturing"]},
+    "nvidia":        {"name": "NVIDIA",             "url": "https://www.nvidia.com/en-us/about-nvidia/careers",       "domain": "nvidia.com",             "keywords": ["nvidia"],                                                 "sectors": ["it"]},
+    "servicenow":    {"name": "ServiceNow",         "url": "https://careers.servicenow.com",                          "domain": "servicenow.com",         "keywords": ["servicenow", "service now"],                              "sectors": ["it"]},
+    "workday":       {"name": "Workday",            "url": "https://www.workday.com/en-us/company/careers.html",      "domain": "workday.com",            "keywords": ["workday"],                                                "sectors": ["it"]},
+    "snowflake":     {"name": "Snowflake",          "url": "https://careers.snowflake.com",                           "domain": "snowflake.com",          "keywords": ["snowflake"],                                              "sectors": ["it"]},
+    "netflix":       {"name": "Netflix",            "url": "https://jobs.netflix.com",                                "domain": "netflix.com",            "keywords": ["netflix"],                                                "sectors": ["it", "creative"]},
+
+    # ── Healthcare (payers, providers, pharma, biotech) ─────────────────
+    "unitedhealth":  {"name": "UnitedHealth Group", "url": "https://careers.unitedhealthgroup.com",                   "domain": "unitedhealthgroup.com",  "keywords": ["unitedhealth", "united health"],                          "sectors": ["healthcare"]},
+    "elevance":      {"name": "Elevance Health",    "url": "https://careers.elevancehealth.com",                      "domain": "elevancehealth.com",     "keywords": ["elevance", "anthem"],                                     "sectors": ["healthcare"]},
+    "humana":        {"name": "Humana",             "url": "https://careers.humana.com",                              "domain": "humana.com",             "keywords": ["humana"],                                                 "sectors": ["healthcare"]},
+    "hca":           {"name": "HCA Healthcare",     "url": "https://careers.hcahealthcare.com",                       "domain": "hcahealthcare.com",      "keywords": ["hca"],                                                    "sectors": ["healthcare"]},
+    "kaiser":        {"name": "Kaiser Permanente",  "url": "https://www.kaiserpermanentejobs.org",                    "domain": "kaiserpermanente.org",   "keywords": ["kaiser permanente", "kaiser"],                            "sectors": ["healthcare"]},
+    "cigna":         {"name": "Cigna",              "url": "https://jobs.thecignagroup.com",                          "domain": "cigna.com",              "keywords": ["cigna"],                                                  "sectors": ["healthcare"]},
+    "pfizer":        {"name": "Pfizer",             "url": "https://www.pfizer.com/about/careers",                    "domain": "pfizer.com",             "keywords": ["pfizer"],                                                 "sectors": ["healthcare", "science"]},
+    "jnj":           {"name": "Johnson & Johnson",  "url": "https://www.careers.jnj.com",                             "domain": "jnj.com",                "keywords": ["johnson & johnson", "johnson and johnson", "j&j", "jnj"], "sectors": ["healthcare", "science"]},
+    "merck":         {"name": "Merck",              "url": "https://jobs.merck.com",                                  "domain": "merck.com",              "keywords": ["merck"],                                                  "sectors": ["healthcare", "science"]},
+    "lilly":         {"name": "Eli Lilly",          "url": "https://careers.lilly.com",                               "domain": "lilly.com",              "keywords": ["eli lilly", "lilly"],                                     "sectors": ["healthcare", "science"]},
+    "bms":           {"name": "Bristol Myers Squibb","url": "https://careers.bms.com",                                "domain": "bms.com",                "keywords": ["bristol myers", "bms"],                                   "sectors": ["healthcare", "science"]},
+    "abbvie":        {"name": "AbbVie",             "url": "https://careers.abbvie.com",                              "domain": "abbvie.com",             "keywords": ["abbvie"],                                                 "sectors": ["healthcare", "science"]},
+    "astrazeneca":   {"name": "AstraZeneca",        "url": "https://careers.astrazeneca.com",                         "domain": "astrazeneca.com",        "keywords": ["astrazeneca"],                                            "sectors": ["healthcare", "science"]},
+    "moderna":       {"name": "Moderna",            "url": "https://www.modernatx.com/careers",                       "domain": "modernatx.com",          "keywords": ["moderna"],                                                "sectors": ["healthcare", "science"]},
+    "clevelandclinic":{"name": "Cleveland Clinic",  "url": "https://jobs.clevelandclinic.org",                        "domain": "clevelandclinic.org",    "keywords": ["cleveland clinic"],                                       "sectors": ["healthcare"]},
+
+    # ── Manufacturing / Defense / Aerospace / Automotive ────────────────
+    "boeing":        {"name": "Boeing",             "url": "https://jobs.boeing.com",                                 "domain": "boeing.com",             "keywords": ["boeing"],                                                 "sectors": ["manufacturing", "engineering"]},
+    "lockheed":      {"name": "Lockheed Martin",    "url": "https://www.lockheedmartinjobs.com",                      "domain": "lockheedmartin.com",     "keywords": ["lockheed", "lockheed martin"],                            "sectors": ["manufacturing", "engineering", "government"]},
+    "rtx":           {"name": "RTX (Raytheon)",     "url": "https://careers.rtx.com",                                 "domain": "rtx.com",                "keywords": ["rtx", "raytheon"],                                        "sectors": ["manufacturing", "engineering", "government"]},
+    "ge":            {"name": "General Electric",   "url": "https://jobs.gecareers.com",                              "domain": "ge.com",                 "keywords": ["ge", "general electric"],                                 "sectors": ["manufacturing", "engineering"]},
+    "caterpillar":   {"name": "Caterpillar",        "url": "https://careers.caterpillar.com",                         "domain": "caterpillar.com",        "keywords": ["caterpillar", "cat inc"],                                 "sectors": ["manufacturing", "construction"]},
+    "ford":          {"name": "Ford Motor Company", "url": "https://corporate.ford.com/careers",                      "domain": "ford.com",               "keywords": ["ford"],                                                   "sectors": ["manufacturing", "engineering"]},
+    "gm":            {"name": "General Motors",     "url": "https://search-careers.gm.com",                           "domain": "gm.com",                 "keywords": ["general motors", "gm"],                                   "sectors": ["manufacturing", "engineering"]},
+    "tesla":         {"name": "Tesla",              "url": "https://www.tesla.com/careers",                           "domain": "tesla.com",              "keywords": ["tesla"],                                                  "sectors": ["manufacturing", "engineering", "it"]},
+    "deere":         {"name": "John Deere",         "url": "https://careers.deere.com",                               "domain": "deere.com",              "keywords": ["john deere", "deere"],                                    "sectors": ["manufacturing", "construction"]},
+    "mmm":           {"name": "3M",                 "url": "https://www.3m.com/3M/en_US/careers-us",                  "domain": "3m.com",                 "keywords": ["3m"],                                                     "sectors": ["manufacturing"]},
+    "honeywell":     {"name": "Honeywell",          "url": "https://careers.honeywell.com",                           "domain": "honeywell.com",          "keywords": ["honeywell"],                                              "sectors": ["manufacturing", "engineering"]},
+    "northrop":      {"name": "Northrop Grumman",   "url": "https://www.northropgrumman.com/careers",                 "domain": "northropgrumman.com",    "keywords": ["northrop", "northrop grumman"],                           "sectors": ["manufacturing", "engineering", "government"]},
+    "gd":            {"name": "General Dynamics",   "url": "https://www.gd.com/careers",                              "domain": "gd.com",                 "keywords": ["general dynamics"],                                       "sectors": ["manufacturing", "engineering", "government"]},
+    "boozallen":     {"name": "Booz Allen Hamilton","url": "https://careers.boozallen.com",                           "domain": "boozallen.com",          "keywords": ["booz allen", "booz allen hamilton"],                      "sectors": ["it", "government", "engineering"]},
+
+    # ── Energy / Oil & Gas / Utilities ──────────────────────────────────
+    "exxon":         {"name": "ExxonMobil",         "url": "https://jobs.exxonmobil.com",                             "domain": "exxonmobil.com",         "keywords": ["exxon", "exxonmobil"],                                    "sectors": ["engineering", "manufacturing"]},
+    "chevron":       {"name": "Chevron",            "url": "https://careers.chevron.com",                             "domain": "chevron.com",            "keywords": ["chevron"],                                                "sectors": ["engineering", "manufacturing"]},
+    "conoco":        {"name": "ConocoPhillips",     "url": "https://www.conocophillips.com/careers",                  "domain": "conocophillips.com",     "keywords": ["conocophillips", "conoco"],                               "sectors": ["engineering", "manufacturing"]},
+    "slb":           {"name": "SLB (Schlumberger)", "url": "https://careers.slb.com",                                 "domain": "slb.com",                "keywords": ["schlumberger", "slb"],                                    "sectors": ["engineering"]},
+    "nextera":       {"name": "NextEra Energy",     "url": "https://www.nexteraenergy.com/careers.html",              "domain": "nexteraenergy.com",      "keywords": ["nextera"],                                                "sectors": ["engineering"]},
+
+    # ── Media / Streaming / Mobility ────────────────────────────────────
+    "comcast":       {"name": "Comcast",            "url": "https://jobs.comcast.com",                                "domain": "comcast.com",            "keywords": ["comcast", "xfinity"],                                     "sectors": ["it", "customer_service", "creative"]},
+    "spotify":       {"name": "Spotify",            "url": "https://www.lifeatspotify.com",                           "domain": "spotify.com",            "keywords": ["spotify"],                                                "sectors": ["it", "creative"]},
+    "uber":          {"name": "Uber",               "url": "https://www.uber.com/us/en/careers",                      "domain": "uber.com",               "keywords": ["uber"],                                                   "sectors": ["it", "transport"]},
+    "lyft":          {"name": "Lyft",               "url": "https://www.lyft.com/careers",                            "domain": "lyft.com",               "keywords": ["lyft"],                                                   "sectors": ["it", "transport"]},
+    "airbnb":        {"name": "Airbnb",             "url": "https://careers.airbnb.com",                              "domain": "airbnb.com",             "keywords": ["airbnb"],                                                 "sectors": ["it", "hospitality"]},
+})
+
+
+# Merge sector tags into the original 50 entries (Phase 1C additions already
+# include `sectors` inline).
+for _k, _sect in _DIRECTORY_SECTORS.items():
+    if _k in CAREERS_DIRECTORY:
+        CAREERS_DIRECTORY[_k]["sectors"] = _sect
+
+
 def _careers_directory_lookup(company: str) -> Optional[dict]:
     """Fuzzy-match a user-typed company string against CAREERS_DIRECTORY.
     Strips common legal suffixes first, then tries (a) exact key match,
@@ -727,14 +892,15 @@ def _careers_directory_lookup(company: str) -> Optional[dict]:
 @app.get("/pv/careers/directory")
 async def get_careers_directory():
     """Return the full curated CAREERS_DIRECTORY as a list, alphabetically by
-    company name. Each entry has name, domain, url, logo_url. Used by the
-    Top Employers browse page; no auth required (public discovery)."""
+    company name. Each entry has name, domain, url, logo_url, sectors. Used
+    by the Top Employers browse page; no auth required (public discovery)."""
     rows = []
     for entry in CAREERS_DIRECTORY.values():
         rows.append({
             "name": entry["name"],
             "url": entry["url"],
             "domain": entry["domain"],
+            "sectors": entry.get("sectors", []),
             "logo_url": ("https://www.google.com/s2/favicons?domain="
                          + entry["domain"] + "&sz=128"),
         })
