@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -1285,6 +1285,228 @@ def _normalize_adzuna_item(item: dict) -> Optional[dict]:
     }
 
 
+# ── Greenhouse normalization helpers ──────────────────────────────────────────
+# Greenhouse is a per-employer ATS. Each company has its own public board at
+# https://boards-api.greenhouse.io/v1/boards/{slug}/jobs and the slug is
+# determined by the employer (usually their company name as lowercase-hyphens
+# or lowercase-concatenated). Lat/lng aren't in the payload, so we geocode
+# the location string via Google with an in-memory per-process cache.
+
+# In-memory geocode cache, keyed by location string. Reset on each Render
+# redeploy. Cheap to rebuild (~50-200 unique locations per cron tick).
+_GREENHOUSE_GEOCODE_CACHE = {}
+
+
+def _get_watched_companies() -> List[str]:
+    """Read distinct non-empty company filters across all non-off searches.
+    Drives which Greenhouse boards we attempt to pull from on this tick."""
+    companies = []
+    try:
+        with get_db() as conn:
+            c = conn.cursor()
+            c.execute("""
+                SELECT DISTINCT TRIM(company) AS co
+                FROM pv_searches
+                WHERE company IS NOT NULL
+                  AND TRIM(company) <> ''
+                  AND alert_level <> 'off'
+                ORDER BY co
+            """)
+            for row in c.fetchall():
+                if row[0]:
+                    companies.append(row[0])
+    except Exception as e:
+        print("[greenhouse] failed to read watched companies: " + str(e))
+    return companies
+
+
+def _greenhouse_slug_variants(company: str) -> List[str]:
+    """Generate likely Greenhouse board slugs for a company name. We try the
+    hyphenated form first (most common), then concatenated, then first-word.
+    Stops at the first variant that returns a real board."""
+    if not company:
+        return []
+    s = company.lower().strip()
+    # Strip common legal suffixes that aren't part of the slug.
+    s = re.sub(r'\s+(inc\.?|corp\.?|llc|ltd\.?|llp|holdings?|group|co\.?|company)$', '', s)
+    # Strip punctuation except spaces and hyphens.
+    s = re.sub(r"[^\w\s\-]", "", s)
+    s = s.strip()
+    if not s:
+        return []
+    variants = []
+    hyphenated = re.sub(r"\s+", "-", s)
+    variants.append(hyphenated)
+    concat = re.sub(r"\s+", "", s)
+    if concat != hyphenated:
+        variants.append(concat)
+    parts = s.split()
+    first = parts[0] if parts else ""
+    if first and first not in (hyphenated, concat):
+        variants.append(first)
+    return variants
+
+
+def _greenhouse_sector_for_department(dept_name) -> str:
+    """Map a Greenhouse 'department' string (free-text per employer) to one
+    of our 21 sector slugs. Falls back to 'administration' when unrecognized."""
+    if not dept_name:
+        return "administration"
+    d = str(dept_name).lower()
+    if any(w in d for w in ["engineering", "software", "infrastructure", "devops",
+                            "platform", "backend", "frontend", "fullstack", "sre"]):
+        return "engineering"
+    if any(w in d for w in ["information technology", " it ", "it ", "tech support",
+                            "systems", "security", "cyber"]):
+        return "it"
+    if "product" in d:
+        return "it"
+    if any(w in d for w in ["data", "analytics", "machine learning", "research",
+                            " ml ", " ai ", "science"]):
+        return "science"
+    if any(w in d for w in ["design", "creative", "brand", " ux", " ui"]):
+        return "creative"
+    if any(w in d for w in ["marketing", "growth", "communications", " pr "]):
+        return "marketing"
+    if any(w in d for w in ["sales", "business development", "account executive",
+                            "revenue"]):
+        return "sales"
+    if any(w in d for w in ["finance", "accounting", "treasury"]):
+        return "finance"
+    if any(w in d for w in ["people", "human resources", "talent", "recruit", " hr"]):
+        return "hr"
+    if any(w in d for w in ["legal", "compliance"]):
+        return "legal"
+    if any(w in d for w in ["customer", "support", "success"]):
+        return "customer_service"
+    if any(w in d for w in ["operations", " ops", "logistics", "supply"]):
+        return "transport"
+    if any(w in d for w in ["education", "teaching", "training", "learning"]):
+        return "education"
+    if any(w in d for w in ["health", "medical", "clinical"]):
+        return "healthcare"
+    return "administration"
+
+
+def _geocode_location_cached(location_name: str):
+    """Forward-geocode a location string via Google, caching results in memory.
+    Returns (lat, lng) tuple or (None, None) on failure / no key configured."""
+    if not location_name:
+        return (None, None)
+    key = location_name.strip().lower()
+    if key in _GREENHOUSE_GEOCODE_CACHE:
+        return _GREENHOUSE_GEOCODE_CACHE[key]
+    if not GOOGLE_GEOCODING_API_KEY:
+        _GREENHOUSE_GEOCODE_CACHE[key] = (None, None)
+        return (None, None)
+    try:
+        url = ("https://maps.googleapis.com/maps/api/geocode/json?address="
+               + urllib.parse.quote(location_name)
+               + "&key=" + GOOGLE_GEOCODING_API_KEY)
+        req = urllib.request.Request(url, headers={"User-Agent": "pivot.watch/0.1"})
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            data = json_lib.loads(resp.read().decode("utf-8", errors="replace"))
+        if data.get("status") == "OK":
+            results = data.get("results") or []
+            if results:
+                loc = ((results[0].get("geometry") or {}).get("location")) or {}
+                lat = loc.get("lat")
+                lng = loc.get("lng")
+                if lat is not None and lng is not None:
+                    pair = (float(lat), float(lng))
+                    _GREENHOUSE_GEOCODE_CACHE[key] = pair
+                    return pair
+    except Exception as e:
+        print("[geocode-cache] '" + location_name + "' failed: " + str(e))
+    _GREENHOUSE_GEOCODE_CACHE[key] = (None, None)
+    return (None, None)
+
+
+def _strip_html_tags(s: str) -> str:
+    """Strip HTML tags and decode entities from a Greenhouse content field."""
+    if not s:
+        return ""
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html_lib.unescape(s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _normalize_greenhouse_item(job: dict, queried_company: str) -> Optional[dict]:
+    """Map one Greenhouse /jobs item into the pv_jobs dict shape."""
+    job_id = job.get("id") or job.get("internal_job_id")
+    if not job_id:
+        return None
+
+    title = (job.get("title") or "").strip()
+    company = (job.get("company_name") or queried_company or "").strip()
+
+    # Location: 'location.name' if present, otherwise compose from offices[].
+    location_name = ""
+    loc = job.get("location") or {}
+    if isinstance(loc, dict):
+        location_name = (loc.get("name") or "").strip()
+    if not location_name:
+        offices = job.get("offices") or []
+        if offices and isinstance(offices, list):
+            names = []
+            for o in offices:
+                n = (o or {}).get("name") or (o or {}).get("location") or ""
+                if n:
+                    names.append(n.strip())
+            location_name = ", ".join(names[:3])  # cap at 3 to keep readable
+
+    # Remote detection: scan title + location for "remote" / "wfh" / "work from home".
+    combined = (title + " " + location_name).lower()
+    is_remote = "remote" in combined or "wfh" in combined or "work from home" in combined
+
+    # Geocode the location for radius search support (cached).
+    lat, lng = (None, None)
+    if location_name and not is_remote:
+        lat, lng = _geocode_location_cached(location_name)
+
+    # Sector from departments[0].name (free-text per employer).
+    sector = "administration"
+    depts = job.get("departments") or []
+    if depts and isinstance(depts, list):
+        first_dept = (depts[0] or {}).get("name")
+        sector = _greenhouse_sector_for_department(first_dept)
+
+    # Level from title keywords (Greenhouse has no structured level).
+    level = _level_from_title_keywords(title)
+
+    # Description: strip HTML from 'content'.
+    description = _strip_html_tags(job.get("content") or "")
+    if description and len(description) > 2000:
+        description = description[:2000] + "…"
+
+    # URL: absolute_url is the canonical public link.
+    url = job.get("absolute_url") or ""
+
+    # Posted at: updated_at is the most useful timestamp Greenhouse exposes.
+    posted_at = job.get("updated_at") or job.get("first_published")
+
+    return {
+        "source": "greenhouse",
+        "external_id": str(job_id),
+        "title": title,
+        "company": company,
+        "sector": sector,
+        "level": level,
+        "location_name": location_name,
+        "lat": lat,
+        "lng": lng,
+        "is_remote": is_remote,
+        "salary_min": None,           # Greenhouse doesn't expose salary
+        "salary_max": None,
+        "salary_currency": "USD",
+        "description": description,
+        "url": url,
+        "posted_at": posted_at,
+        "raw": job,
+    }
+
+
 class Sources:
     """All job feed adapters. Each fetch_* returns a list of normalized job dicts."""
 
@@ -1416,12 +1638,61 @@ class Sources:
         return out
 
     # ── Greenhouse (per-employer ATS feeds) ───────────────────────────────────
-    # Stub for v0.1.0. v0.1.3 will pull from
-    # https://boards-api.greenhouse.io/v1/boards/{company_slug}/jobs
-    # for each company name appearing in active pv_searches rows. Public, no key.
+    # Stub for v0.1.0. v0.1.7+ pulls from
+    # https://boards-api.greenhouse.io/v1/boards/{company_slug}/jobs for each
+    # distinct company filter appearing in active pv_searches rows. Public, no
+    # key, no auth. The slug is unknown ahead of time so we try a few common
+    # variants per company name (hyphenated, concatenated, first-word).
     @staticmethod
     def fetch_greenhouse() -> List[dict]:
-        return []
+        companies = _get_watched_companies()
+        if not companies:
+            print("[greenhouse] no company filters in active searches; skipping")
+            return []
+        print("[greenhouse] companies in active searches: " + ", ".join(companies))
+
+        out = []
+        hits = 0
+        for company in companies:
+            slug_used = None
+            jobs_payload = None
+            # Try each slug variant until one returns 200 with a 'jobs' key.
+            for slug in _greenhouse_slug_variants(company):
+                url = "https://boards-api.greenhouse.io/v1/boards/" + urllib.parse.quote(slug) + "/jobs"
+                try:
+                    req = urllib.request.Request(url, headers={
+                        "User-Agent": Sources.BROWSER_UA,
+                        "Accept": "application/json",
+                    })
+                    with urllib.request.urlopen(req, timeout=15) as resp:
+                        data = json_lib.loads(resp.read().decode("utf-8", errors="replace"))
+                    if isinstance(data, dict) and "jobs" in data:
+                        slug_used = slug
+                        jobs_payload = data.get("jobs") or []
+                        break
+                except urllib.error.HTTPError as e:
+                    # 404 is the normal "no board for this slug" -- try next variant silently.
+                    if e.code != 404:
+                        print("[greenhouse] " + slug + " HTTP " + str(e.code) + " — " + str(e))
+                except Exception as e:
+                    print("[greenhouse] " + slug + " failed: " + str(e))
+
+            if not slug_used:
+                print("[greenhouse] no board found for '" + company + "' (tried variants)")
+                continue
+
+            hits += 1
+            print("[greenhouse] " + company + " → " + slug_used + ": " + str(len(jobs_payload)) + " jobs")
+            for job in jobs_payload:
+                try:
+                    normalized = _normalize_greenhouse_item(job, company)
+                    if normalized:
+                        out.append(normalized)
+                except Exception as e:
+                    print("[greenhouse] normalize failed: " + str(e))
+
+        print("[greenhouse] fetched " + str(len(out)) + " jobs from " + str(hits) + " companies")
+        return out
 
     @staticmethod
     def all_sources() -> List[str]:
