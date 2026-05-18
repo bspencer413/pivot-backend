@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -670,7 +670,7 @@ async def get_search_jobs(search_id: int, user_id: int = Depends(get_current_use
                 (s.radius_value != 'remote' AND s.geom IS NOT NULL AND j.geom IS NOT NULL
                  AND ST_DWithin(j.geom, s.geom, (s.radius_value::int) * 1609.344))
               )
-              AND j.posted_at > NOW() - INTERVAL '30 days'
+              AND j.fetched_at > NOW() - INTERVAL '3 days'
             ORDER BY j.posted_at DESC
             LIMIT 50
         """, (search_id,))
