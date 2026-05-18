@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.10"
+VERSION = "0.1.11"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -492,7 +492,7 @@ async def admin_inspect(sector: Optional[str] = None, source: Optional[str] = No
 
         c.execute(
             "SELECT id, source, company, title, sector, level, location_name, "
-            "lat, lng, is_remote, posted_at, fetched_at "
+            "lat, lng, state, is_remote, posted_at, fetched_at "
             "FROM pv_jobs" + where_clause + " "
             "ORDER BY fetched_at DESC LIMIT %s",
             params + [limit]
@@ -509,9 +509,10 @@ async def admin_inspect(sector: Optional[str] = None, source: Optional[str] = No
                 "location_name": r[6],
                 "lat": float(r[7]) if r[7] is not None else None,
                 "lng": float(r[8]) if r[8] is not None else None,
-                "is_remote": r[9],
-                "posted_at": r[10].isoformat() if r[10] else None,
-                "fetched_at": r[11].isoformat() if r[11] else None,
+                "state": r[9],
+                "is_remote": r[10],
+                "posted_at": r[11].isoformat() if r[11] else None,
+                "fetched_at": r[12].isoformat() if r[12] else None,
             })
 
         return {
@@ -1934,7 +1935,8 @@ class Sources:
             jobs_payload = None
             # Try each slug variant until one returns 200 with a 'jobs' key.
             for slug in _greenhouse_slug_variants(company):
-                url = "https://boards-api.greenhouse.io/v1/boards/" + urllib.parse.quote(slug) + "/jobs"
+                url = ("https://boards-api.greenhouse.io/v1/boards/"
+                       + urllib.parse.quote(slug) + "/jobs?content=true")
                 try:
                     req = urllib.request.Request(url, headers={
                         "User-Agent": Sources.BROWSER_UA,
