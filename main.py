@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.12"
+VERSION = "0.1.13"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -997,6 +997,12 @@ def build_static_map_url(lat: float, lng: float, radius_mi: float, ev_pins: list
         elat, elng = pin[0], pin[1]
         sev = pin[2] if len(pin) >= 3 else "minor"
         hazard_type = pin[3] if len(pin) >= 4 else None
+        if hazard_type == "job":
+            # pivot.watch: bright red Google-native marker. Always renders, no
+            # external icon CDN dependency. Visible against terrain background.
+            markers.append("color:0xdc2626|size:mid|"
+                           + str(round(elat, 5)) + "," + str(round(elng, 5)))
+            continue
         cp = hazard_cp.get(hazard_type or "")
         if cp:
             markers.append("icon:" + icon_base + cp + ".png|" + str(round(elat, 5)) + "," + str(round(elng, 5)))
