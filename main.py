@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.16"
+VERSION = "0.1.17"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -438,6 +438,31 @@ async def admin_check_now():
     """Manually trigger a full source pull + filter-join + alert pass."""
     threading.Thread(target=run_check_cycle, daemon=True).start()
     return {"message": "pivot.watch check cycle started"}
+
+
+@app.get("/admin/cleanup-wake-island")
+async def admin_cleanup_wake_island():
+    """One-off purge of Adzuna's polluted 'Wake Island, Honolulu' rows. These
+    are jobs Adzuna couldn't precisely geocode and defaulted to the Wake
+    Island administrative center coords (21.3072, -157.8465) -- the actual
+    jobs are scattered nationwide (Nashville, AZ, etc.). v0.1.17 normalizer
+    prevents new pollution; this endpoint clears existing rows immediately
+    instead of waiting up to 12h for cron to overwrite them."""
+    with get_db() as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT COUNT(*) FROM pv_jobs
+            WHERE source = 'adzuna'
+              AND LOWER(location_name) LIKE 'wake island%'
+        """)
+        before = int(c.fetchone()[0])
+        c.execute("""
+            DELETE FROM pv_jobs
+            WHERE source = 'adzuna'
+              AND LOWER(location_name) LIKE 'wake island%'
+        """)
+        conn.commit()
+        return {"deleted": before, "version": VERSION}
 
 
 @app.get("/admin/inspect")
@@ -1650,6 +1675,21 @@ def _normalize_adzuna_item(item: dict) -> Optional[dict]:
             state = US_STATE_NAME_TO_CODE.get((area[1] or "").strip().lower())
     if not state:
         state = _extract_state_code(location_name)
+
+    # ── Adzuna data-quality filter ────────────────────────────────────────
+    # When Adzuna can't precisely geocode a job, they default to the
+    # administrative center of the search area. For Hawaii queries, this
+    # surfaces as display_name = "Wake Island, Honolulu" with all such jobs
+    # sharing identical coords (21.3072, -157.8465). Wake Island is a 2,300-
+    # mile-distant Pacific atoll, not the actual job site -- the real jobs
+    # are scattered (Nashville, AZ, etc., often visible in the title). Strip
+    # location so these jobs only surface in 'Anywhere' searches, never as
+    # false-positive Honolulu radius hits.
+    if location_name and location_name.lower().lstrip().startswith("wake island"):
+        location_name = ""
+        lat = None
+        lng = None
+        state = None
 
     # Remote detection: Adzuna doesn't have a structured flag. Check title
     # and location strings for the "remote" keyword.
