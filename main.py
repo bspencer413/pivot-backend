@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.18"
+VERSION = "0.1.19"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -1676,20 +1676,11 @@ def _normalize_adzuna_item(item: dict) -> Optional[dict]:
     if not state:
         state = _extract_state_code(location_name)
 
-    # ── Adzuna data-quality filter ────────────────────────────────────────
-    # When Adzuna can't precisely geocode a job, they default to the
-    # administrative center of the search area. For Hawaii queries, this
-    # surfaces as display_name = "Wake Island, Honolulu" with all such jobs
-    # sharing identical coords (21.3072, -157.8465). Wake Island is a 2,300-
-    # mile-distant Pacific atoll, not the actual job site -- the real jobs
-    # are scattered (Nashville, AZ, etc., often visible in the title). Strip
-    # location so these jobs only surface in 'Anywhere' searches, never as
-    # false-positive Honolulu radius hits.
-    if location_name and location_name.lower().lstrip().startswith("wake island"):
-        location_name = ""
-        lat = None
-        lng = None
-        state = None
+    # Note: an earlier v0.1.17 filter stripped Wake Island-tagged Adzuna
+    # jobs as suspected pollution. Reverted v0.1.19 -- Wake Island Airfield
+    # is a working US military installation, and contractors (KBR, Lockheed,
+    # Booz Allen, etc.) do staff legitimate positions there. Better to let
+    # users see and decide than to silently drop potentially-real jobs.
 
     # Remote detection: Adzuna doesn't have a structured flag. Use explicit
     # WFH phrases rather than the bare word "remote" -- which over-fires on
