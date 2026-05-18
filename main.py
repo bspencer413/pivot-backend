@@ -33,7 +33,7 @@ RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
 FROM_EMAIL = os.environ.get("FROM_EMAIL", "alerts@pivot.watch")
 GOOGLE_GEOCODING_API_KEY = os.environ.get("GOOGLE_GEOCODING_API_KEY", "")
 
-VERSION = "0.1.19"
+VERSION = "0.1.20"
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if not DATABASE_URL:
@@ -722,6 +722,24 @@ def _careers_directory_lookup(company: str) -> Optional[dict]:
             if kw and kw in s:
                 return dict(entry, _key=k)
     return None
+
+
+@app.get("/pv/careers/directory")
+async def get_careers_directory():
+    """Return the full curated CAREERS_DIRECTORY as a list, alphabetically by
+    company name. Each entry has name, domain, url, logo_url. Used by the
+    Top Employers browse page; no auth required (public discovery)."""
+    rows = []
+    for entry in CAREERS_DIRECTORY.values():
+        rows.append({
+            "name": entry["name"],
+            "url": entry["url"],
+            "domain": entry["domain"],
+            "logo_url": ("https://www.google.com/s2/favicons?domain="
+                         + entry["domain"] + "&sz=128"),
+        })
+    rows.sort(key=lambda r: r["name"].lower())
+    return {"directory": rows, "count": len(rows)}
 
 
 @app.get("/pv/careers")
