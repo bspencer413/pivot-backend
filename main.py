@@ -454,6 +454,39 @@ async def get_stats():
         }
 
 
+@app.get("/admin/platform-stats")
+async def admin_platform_stats():
+    """Aggregate signup metrics for the scoreboard. Public, no auth — counts only."""
+    # Per-backend config: (actual_table_name, response_key_for_scoreboard)
+    targets = [("users", "pv_users")]
+    result = {}
+    with get_db() as conn:
+        c = conn.cursor()
+        for table, key in targets:
+            try:
+                c.execute("""
+                    SELECT
+                        COUNT(*),
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '24 hours'),
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '7 days'),
+                        COUNT(*) FILTER (WHERE created_at >= NOW() - INTERVAL '30 days'),
+                        MAX(created_at)
+                    FROM {}
+                """.format(table))
+                row = c.fetchone()
+                result[key] = {
+                    "total_users": row[0],
+                    "signups_24h": row[1],
+                    "signups_7d": row[2],
+                    "signups_30d": row[3],
+                    "latest_signup_at": row[4].isoformat() if row[4] else None
+                }
+            except Exception as e:
+                conn.rollback()
+                result[key] = {"error": str(e)}
+        return result
+
+
 @app.get("/admin/check-now")
 async def admin_check_now():
     """Manually trigger a full source pull + filter-join + alert pass."""
