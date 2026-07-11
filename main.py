@@ -1452,7 +1452,9 @@ class GeocodeQuery(BaseModel):
     query: str
 
 @app.post("/pv/geocode")
-async def geocode_place(q: GeocodeQuery, user_id: int = Depends(get_current_user)):
+# v: public route — anon users must be able to geocode/preview a place before
+# signing up. Save is still the auth trigger. user_id was unused in the body.
+async def geocode_place(q: GeocodeQuery):
     """Forward geocode a free-text query (city, address, landmark) via Google.
     Returns up to 5 candidates so the user can pick the right match.
     Backend-side so the API key never lives in the frontend."""
