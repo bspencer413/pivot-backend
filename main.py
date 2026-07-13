@@ -1116,6 +1116,13 @@ async def add_search(item: SearchItem, user_id: int = Depends(get_current_user))
               where_mode, state_code, alert_level))
         row = c.fetchone()
         conn.commit()
+        # v: on-demand Adzuna seed. Pull private-sector jobs for THIS search's
+        # location right now (background thread, so the save returns instantly),
+        # instead of waiting for the 12h cron's popularity-based sampling. This
+        # is what gives a brand-new "near a place" search real coverage.
+        if where_mode == "address" and location_name:
+            threading.Thread(target=_seed_adzuna_for_search,
+                             args=(location_name,), daemon=True).start()
         return {
             "message": "Search added",
             "id": row[0],
@@ -2688,6 +2695,65 @@ def filter_match_and_alert(conn, new_job_ids: List[int]) -> int:
             c = conn.cursor()
     conn.commit()
     return fired
+
+
+def _fetch_adzuna_where(where: str, max_pages: int = 3) -> List[dict]:
+    """On-demand Adzuna pull for a single location string (a just-saved search's
+    location). Mirrors fetch_adzuna's per-location phase but standalone, so
+    saving a "near a place" search seeds jobs for exactly that place instead of
+    waiting for the 12h cron's popularity-based sampling."""
+    app_id = (os.environ.get("ADZUNA_APP_ID") or "").strip()
+    app_key = (os.environ.get("ADZUNA_APP_KEY") or "").strip()
+    if not app_id or not app_key or not where:
+        return []
+    results_per_page = 50
+    out = []
+    for page in range(1, max_pages + 1):
+        url = ("https://api.adzuna.com/v1/api/jobs/us/search/" + str(page)
+               + "?app_id=" + urllib.parse.quote(app_id)
+               + "&app_key=" + urllib.parse.quote(app_key)
+               + "&results_per_page=" + str(results_per_page)
+               + "&sort_by=date"
+               + "&where=" + urllib.parse.quote(where))
+        try:
+            req = urllib.request.Request(url, headers={
+                "User-Agent": Sources.BROWSER_UA,
+                "Accept": "application/json",
+            })
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json_lib.loads(resp.read().decode("utf-8", errors="replace"))
+        except Exception as e:
+            print("[adzuna on-demand] where='" + where + "' page " + str(page) + " failed: " + str(e))
+            break
+        results = data.get("results") or []
+        for item in results:
+            try:
+                normalized = _normalize_adzuna_item(item)
+                if normalized:
+                    out.append(normalized)
+            except Exception as e:
+                print("[adzuna on-demand] normalize failed: " + str(e))
+        if len(results) < results_per_page:
+            break
+    print("[adzuna on-demand] where='" + where + "': " + str(len(out)) + " jobs")
+    return out
+
+
+def _seed_adzuna_for_search(location_name: str):
+    """Background: pull Adzuna for a just-saved search's location and upsert into
+    pv_jobs. Fire-and-forget so the save response isn't blocked."""
+    try:
+        where = _clean_location_for_adzuna(location_name)
+        if not where:
+            return
+        normalized = _fetch_adzuna_where(where)
+        if not normalized:
+            return
+        with get_db() as conn:
+            upsert_jobs(conn, normalized)
+        print("[adzuna on-demand] seeded " + str(len(normalized)) + " jobs for '" + where + "'")
+    except Exception as e:
+        print("[adzuna on-demand] seed failed: " + str(e))
 
 
 def run_check_cycle():
